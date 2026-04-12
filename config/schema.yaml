@@ -1,0 +1,36 @@
+# Hermes Control Plane Configuration
+# This file configures thresholds, weights, and enabled control levels.
+
+version: 1
+
+ups_weights:
+  cpu_some: 0.20
+  mem_some: 0.175
+  mem_full: 0.175  # Mem weights sum to 0.35
+  gpu_util: 0.15
+  vram_used: 0.30
+
+thresholds:
+  ups:
+    elevated: 40
+    critical: 70
+  mem_psi:
+    elevated_full_avg10: 2.0
+    critical_full_avg10: 5.0
+  vram:
+    high_pct: 90
+    critical_pct: 95
+  predictor:
+    high_risk: 0.70
+
+cooldowns:
+  level_1_pid_sec: 15
+  level_2_pid_sec: 20
+  level_3_global_sec: 300
+  recovery_hysteresis_sec: 10
+
+actions:
+  enable_level_1: true
+  enable_level_2: false
+  enable_level_3: false
+  observe_only_mode: true

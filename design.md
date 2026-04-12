@@ -1371,3 +1371,32 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
   - `artifacts/logs/codex-smoke-script-20260413/replay_summary.json`
   - `artifacts/replay/codex-smoke-script-20260413-summary.json`
+
+#### 2026-04-13 02:17 IST - Replay Summary Copy Pass
+- Verified repo facts:
+  - Before this pass, the full initial Hermes scaffold was committed and pushed to the private GitHub repository `kumarabhik/Hermes` on branch `main`.
+  - `HERMES_EXPLANATION.md` is ignored by `.gitignore` and was not included in the GitHub commit.
+  - `src/cli/hermes_replay.cpp` now writes replay summaries to the run directory, `artifacts/replay/<run_id>-summary.json`, and `artifacts/summaries/<run_id>-summary.json`.
+  - `scripts/smoke_synthetic_replay.ps1` now verifies that the `artifacts/summaries/` copy exists and matches the run id.
+  - `README.md` documents the summary copy path and updated smoke behavior.
+  - `roadmap.md` now records summary-copy behavior.
+- Decisions made:
+  - Kept `artifacts/replay/` as the replay-specific copy while adding `artifacts/summaries/` as the general summary lane for future smoke and benchmark outputs.
+  - Made the smoke script validate the summary copy directly instead of relying only on replay exit code.
+- Assumptions still in force:
+  - Generated summary artifacts remain ignored by git.
+  - This is still synthetic replay validation, not live benchmark evidence.
+  - CMake remains unavailable in this shell, so direct `g++` smoke verification is still the local path.
+- Open risks:
+  - No CSV summary table exists yet.
+  - There is not yet a Linux shell equivalent of the PowerShell smoke script.
+  - The GitHub repository was created private by default because public visibility was not requested.
+- Next recommended actions:
+  - Add a compact CSV summary writer under `artifacts/summaries/` for fixture and future benchmark rows.
+  - Add a Linux shell smoke script or CTest wrapper once CMake is available.
+  - Add a daemon one-loop smoke script that verifies live observe artifact generation.
+- Evidence paths / artifacts:
+  - `src/cli/hermes_replay.cpp`
+  - `scripts/smoke_synthetic_replay.ps1`
+  - `README.md`
+  - `roadmap.md`

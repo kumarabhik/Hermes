@@ -22,6 +22,7 @@ Current repo state verified after the first native backend scaffold pass:
 - A replay summary CLI can validate and summarize a run directory into `replay_summary.json`, including metadata/config snapshot and telemetry-quality artifact presence plus optional `scenario_manifest.json` signal, count, and threshold assertions.
 - A synthetic fixture CLI can generate deterministic pressure traces that exercise Level 1, Level 2, Level 3, cooldown, and recovery scheduler paths without live GPU pressure.
 - A PowerShell smoke script can build the synthetic fixture/replay tools, generate a fixture run, replay it, and fail on manifest assertion errors.
+- Replay summaries are copied into both `artifacts/replay/` and `artifacts/summaries/` for easier downstream discovery.
 - Direct compilation was verified with `g++`; `cmake` was not available in this shell, so the CMake path was not exercised here.
 - No benchmark run outputs, replay bundles, `strace` captures, `perf` captures, or active-control actions exist yet.
 
@@ -95,7 +96,7 @@ Current repo state verified after the first native backend scaffold pass:
 ## Phase 5: Operator UX, Replay, and Documentation
 
 - [ ] Live CLI dashboard exposes UPS, predictor state, per-PID attribution, and recent decisions.
-- [~] Replay workflow can inspect saved event and sample logs, verify metadata/config snapshot and telemetry-quality artifact presence, assert synthetic pressure fixture signal/count/threshold manifests, and emit a summary artifact; full decision reconstruction and policy re-execution are still pending.
+- [~] Replay workflow can inspect saved event and sample logs, verify metadata/config snapshot and telemetry-quality artifact presence, assert synthetic pressure fixture signal/count/threshold manifests, and emit summary artifacts under both replay and summaries directories; full decision reconstruction and policy re-execution are still pending.
 - [ ] Operator documentation explains deployment assumptions, privilege modes, safety guardrails, and benchmark procedure.
 - [ ] Operator documentation explains the native collector path, kernel observability options, replay mode, fault injection, and cgroup backend behavior.
 - [ ] README or operator documentation summarizes at least one real `strace` finding and one real `perf` finding with links to evidence artifacts.

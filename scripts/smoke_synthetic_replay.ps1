@@ -60,13 +60,21 @@ try {
     }
 
     $summaryPath = Join-Path $runDirectory "replay_summary.json"
+    $artifactSummaryPath = Join-Path (Join-Path $ArtifactRoot "summaries") ($RunId + "-summary.json")
     if (!(Test-Path $summaryPath)) {
         throw "Replay summary was not written: $summaryPath"
     }
+    if (!(Test-Path $artifactSummaryPath)) {
+        throw "Artifact summary copy was not written: $artifactSummaryPath"
+    }
 
     $summary = Get-Content -Path $summaryPath -Raw | ConvertFrom-Json
+    $artifactSummary = Get-Content -Path $artifactSummaryPath -Raw | ConvertFrom-Json
     if ($summary.valid -ne $true) {
         throw "Replay summary is invalid"
+    }
+    if ($artifactSummary.run_id -ne $summary.run_id) {
+        throw "Artifact summary copy has a mismatched run_id"
     }
     if ([int]$summary.manifest_assertions.checked -lt 1) {
         throw "No manifest assertions were checked"
@@ -80,6 +88,7 @@ try {
 
     Write-Host "Synthetic replay smoke passed"
     Write-Host "Run directory: $runDirectory"
+    Write-Host "Summary copy: $artifactSummaryPath"
     Write-Host "Assertions: $($summary.manifest_assertions.passed)/$($summary.manifest_assertions.checked)"
     Write-Host "Peak UPS: $($summary.peaks.ups)"
     Write-Host "Peak risk: $($summary.peaks.risk_score)"

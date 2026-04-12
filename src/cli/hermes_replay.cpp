@@ -19,7 +19,7 @@ void print_usage() {
     std::cout << "Usage: hermes_replay <run-directory> [artifact-root]\n"
               << "\n"
               << "Summarizes Hermes NDJSON artifacts from a daemon run directory.\n"
-              << "Writes replay_summary.json beside the run and copies the summary to artifacts/replay/.\n";
+              << "Writes replay_summary.json beside the run and copies the summary to artifacts/replay/ and artifacts/summaries/.\n";
 }
 
 } // namespace
@@ -46,10 +46,17 @@ int main(int argc, char** argv) {
     }
 
     std::filesystem::path replay_summary_path;
+    std::filesystem::path artifact_summary_path;
     if (!summary.run_id.empty()) {
         replay_summary_path = artifact_root / "replay" / (summary.run_id + "-summary.json");
         if (!builder.write_summary(summary, replay_summary_path, error)) {
             std::cerr << "Failed to write replay summary copy: " << error << std::endl;
+            return 2;
+        }
+
+        artifact_summary_path = artifact_root / "summaries" / (summary.run_id + "-summary.json");
+        if (!builder.write_summary(summary, artifact_summary_path, error)) {
+            std::cerr << "Failed to write artifact summary copy: " << error << std::endl;
             return 2;
         }
     }
@@ -66,6 +73,9 @@ int main(int argc, char** argv) {
     std::cout << "Wrote " << run_summary_path.string() << std::endl;
     if (!replay_summary_path.empty()) {
         std::cout << "Wrote " << replay_summary_path.string() << std::endl;
+    }
+    if (!artifact_summary_path.empty()) {
+        std::cout << "Wrote " << artifact_summary_path.string() << std::endl;
     }
 
     if (!summary.warnings.empty()) {

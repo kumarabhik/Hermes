@@ -32,7 +32,7 @@ try {
 
     @"
 name: smoke-launch
-runtime_mode: observe-only
+runtime_mode: baseline
 warmup_s: 0
 measurement_s: 2
 repeat_count: 1

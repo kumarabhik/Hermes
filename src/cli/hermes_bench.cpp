@@ -1,17 +1,20 @@
 // hermes_bench: Benchmark scenario launcher stub.
 //
 // Reads a scenario YAML config, validates it, writes a benchmark plan artifact,
-// and can launch a bounded benchmark workload run with a summary artifact.
+// can launch a bounded benchmark workload run with a summary artifact, and
+// can optionally launch hermesd plus hermes_replay around non-baseline runs.
 //
 // Current status (Phase 4 scaffold):
 //   - Scenario config loading and validation are implemented.
 //   - Plan artifacts are written under artifacts/bench/.
 //   - Bounded workload launch and run summary artifacts are implemented.
-//   - Full benchmark harness with Hermes orchestration, live metric capture,
-//     and benchmark evidence collection is still pending.
+//   - Optional Hermes daemon orchestration and replay summary capture are
+//     implemented for non-baseline runtime modes.
+//   - Rich benchmark evidence collection is still pending.
 //
 // Usage:
 //   hermes_bench <scenario_config.yaml> [--dry-run] [--artifact-root artifacts] [--run-id id]
+//                [--hermes-bin path] [--replay-bin path]
 //   hermes_bench --generate-baseline [output.yaml]
 //   hermes_bench --generate-active [output.yaml]
 
@@ -29,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -89,6 +93,42 @@ struct ExecutionSummary {
     std::vector<std::string> notes;
 };
 
+struct EnvRecord {
+    std::string name;
+    bool had_value{false};
+    std::string value;
+};
+
+struct HermesExecution {
+    bool requested{false};
+    bool launch_ok{false};
+    bool replay_attempted{false};
+    bool replay_ok{false};
+    std::string hermes_bin;
+    std::string replay_bin;
+    std::string run_id;
+    std::string run_directory;
+    std::string launch_error;
+    std::string replay_error;
+    std::filesystem::path replay_summary_path;
+    std::filesystem::path replay_csv_path;
+    ChildProcess child;
+    int replay_exit_code{0};
+    bool replay_exit_code_valid{false};
+};
+
+struct ReplaySummarySnapshot {
+    bool available{false};
+    bool valid{false};
+    uint64_t samples{0};
+    uint64_t decisions{0};
+    uint64_t actions{0};
+    double peak_ups{0.0};
+    double peak_risk_score{0.0};
+    double peak_mem_full_avg10{0.0};
+    double peak_vram_used_mb{0.0};
+};
+
 bool has_flag(const std::vector<std::string>& args, const std::string& flag) {
     for (const auto& a : args) {
         if (a == flag) return true;
@@ -115,7 +155,8 @@ bool option_value(const std::vector<std::string>& args, const std::string& optio
 }
 
 bool is_option_with_value(const std::string& arg) {
-    return arg == "--artifact-root" || arg == "--run-id";
+    return arg == "--artifact-root" || arg == "--run-id" ||
+           arg == "--hermes-bin" || arg == "--replay-bin";
 }
 
 std::string first_positional_arg(const std::vector<std::string>& args) {
@@ -171,6 +212,39 @@ std::string default_run_id(const hermes::BenchmarkScenario& scenario) {
     return "bench-" + sanitize_id_part(scenario.name) + "-" + std::to_string(wall_now_ms());
 }
 
+std::string platform_binary_name(const std::string& base_name) {
+#ifdef _WIN32
+    return base_name + ".exe";
+#else
+    return base_name;
+#endif
+}
+
+std::string resolve_binary_path(
+    const std::string& explicit_path,
+    const std::filesystem::path& current_executable,
+    const std::string& base_name) {
+    if (!explicit_path.empty()) {
+        return explicit_path;
+    }
+
+    std::filesystem::path candidate = current_executable.parent_path() / platform_binary_name(base_name);
+    if (!candidate.empty() && std::filesystem::exists(candidate)) {
+        return candidate.string();
+    }
+
+    return platform_binary_name(base_name);
+}
+
+uint64_t benchmark_window_ms(const hermes::BenchmarkScenario& scenario) {
+    return static_cast<uint64_t>(std::max(0, scenario.warmup_s + scenario.measurement_s)) * 1000ull;
+}
+
+uint64_t hermes_loop_budget(const hermes::BenchmarkScenario& scenario) {
+    const uint64_t window_ms = benchmark_window_ms(scenario);
+    return std::max<uint64_t>(1, ((window_ms + 499ull) / 500ull) + 2ull);
+}
+
 std::string json_escape(const std::string& value) {
     std::ostringstream oss;
     for (const char ch : value) {
@@ -215,6 +289,151 @@ std::string bool_json(bool value) {
     return value ? "true" : "false";
 }
 
+bool runtime_mode_uses_hermes(const std::string& runtime_mode) {
+    return runtime_mode != "baseline";
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        return "";
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+std::string extract_json_string(const std::string& json, const std::string& key) {
+    auto pos = json.find("\"" + key + "\":\"");
+    if (pos != std::string::npos) {
+        const std::size_t start = pos + key.size() + 4;
+        const std::size_t end = json.find('"', start);
+        if (end != std::string::npos) {
+            return json.substr(start, end - start);
+        }
+    }
+
+    const std::string spaced = "\"" + key + "\": \"";
+    pos = json.find(spaced);
+    if (pos == std::string::npos) {
+        return "";
+    }
+    const std::size_t start = pos + spaced.size();
+    const std::size_t end = json.find('"', start);
+    return end == std::string::npos ? "" : json.substr(start, end - start);
+}
+
+double extract_json_double(const std::string& json, const std::string& key) {
+    const auto pos = json.find("\"" + key + "\":");
+    if (pos == std::string::npos) {
+        return 0.0;
+    }
+    std::size_t start = pos + key.size() + 3;
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) {
+        ++start;
+    }
+    if (start >= json.size() || json[start] == '"') {
+        return 0.0;
+    }
+    try {
+        return std::stod(json.substr(start));
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+uint64_t extract_json_uint64(const std::string& json, const std::string& key) {
+    const auto pos = json.find("\"" + key + "\":");
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    std::size_t start = pos + key.size() + 3;
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) {
+        ++start;
+    }
+    if (start >= json.size() || json[start] == '"') {
+        return 0;
+    }
+    try {
+        return static_cast<uint64_t>(std::stoull(json.substr(start)));
+    } catch (...) {
+        return 0;
+    }
+}
+
+bool extract_json_bool(const std::string& json, const std::string& key) {
+    const auto pos = json.find("\"" + key + "\":");
+    if (pos == std::string::npos) {
+        return false;
+    }
+    std::size_t start = pos + key.size() + 3;
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) {
+        ++start;
+    }
+    return start < json.size() && json[start] == 't';
+}
+
+std::string shell_quote(const std::string& value) {
+#ifdef _WIN32
+    std::string out = "\"";
+    for (const char ch : value) {
+        if (ch == '"') {
+            out += "\"\"";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out += "\"";
+    return out;
+#else
+    std::string out = "'";
+    for (const char ch : value) {
+        if (ch == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out += "'";
+    return out;
+#endif
+}
+
+bool get_process_env(const std::string& name, std::string& value) {
+    const char* raw = std::getenv(name.c_str());
+    if (raw == nullptr) {
+        value.clear();
+        return false;
+    }
+    value = raw;
+    return true;
+}
+
+bool set_process_env(const std::string& name, const std::string& value) {
+#ifdef _WIN32
+    return SetEnvironmentVariableA(name.c_str(), value.c_str()) != FALSE;
+#else
+    return setenv(name.c_str(), value.c_str(), 1) == 0;
+#endif
+}
+
+bool unset_process_env(const std::string& name) {
+#ifdef _WIN32
+    return SetEnvironmentVariableA(name.c_str(), nullptr) != FALSE;
+#else
+    return unsetenv(name.c_str()) == 0;
+#endif
+}
+
+std::string join_quoted_command(
+    const std::string& program,
+    const std::vector<std::string>& args) {
+    std::ostringstream oss;
+    oss << shell_quote(program);
+    for (const std::string& arg : args) {
+        oss << " " << shell_quote(arg);
+    }
+    return oss.str();
+}
+
 void print_scenario(const hermes::BenchmarkScenario& s) {
     std::cout << "Scenario         : " << s.name << "\n"
               << "Runtime mode     : " << s.runtime_mode << "\n"
@@ -254,13 +473,56 @@ void close_child_process(ChildProcess& child) {
 #endif
 }
 
+std::vector<EnvRecord> apply_environment_overrides(
+    const std::vector<std::pair<std::string, std::string>>& overrides,
+    std::string& error) {
+    std::vector<EnvRecord> previous;
+    previous.reserve(overrides.size());
+
+    for (const auto& [name, value] : overrides) {
+        EnvRecord record;
+        record.name = name;
+        record.had_value = get_process_env(name, record.value);
+        previous.push_back(record);
+        if (!set_process_env(name, value)) {
+            error = "failed to set environment variable " + name;
+            break;
+        }
+    }
+
+    if (!error.empty()) {
+        for (auto it = previous.rbegin(); it != previous.rend(); ++it) {
+            if (it->had_value) {
+                set_process_env(it->name, it->value);
+            } else {
+                unset_process_env(it->name);
+            }
+        }
+        previous.clear();
+    }
+
+    return previous;
+}
+
+void restore_environment_overrides(const std::vector<EnvRecord>& previous) {
+    for (auto it = previous.rbegin(); it != previous.rend(); ++it) {
+        if (it->had_value) {
+            set_process_env(it->name, it->value);
+        } else {
+            unset_process_env(it->name);
+        }
+    }
+}
+
 PlanValidation validate_plan(const hermes::BenchmarkScenario& scenario) {
     PlanValidation validation;
 
-    if (scenario.runtime_mode != "observe-only" &&
+    if (scenario.runtime_mode != "baseline" &&
+        scenario.runtime_mode != "observe-only" &&
         scenario.runtime_mode != "advisory" &&
         scenario.runtime_mode != "active-control") {
-        validation.errors.push_back("runtime_mode must be observe-only, advisory, or active-control");
+        validation.errors.push_back(
+            "runtime_mode must be baseline, observe-only, advisory, or active-control");
     }
     if (scenario.warmup_s < 0) {
         validation.errors.push_back("warmup_s must be >= 0");
@@ -311,17 +573,15 @@ PlanValidation validate_plan(const hermes::BenchmarkScenario& scenario) {
     return validation;
 }
 
-bool launch_workload(WorkloadExecution& execution, std::string& error) {
-    execution.launch_attempted = true;
-    execution.launch_error.clear();
-    execution.exit_reason = "running";
+bool launch_child_command(const std::string& command, ChildProcess& child, std::string& error) {
+    child = ChildProcess{};
 
 #ifdef _WIN32
     STARTUPINFOA startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process_info{};
 
-    std::string command_line = "cmd.exe /C " + execution.workload.command;
+    std::string command_line = "cmd.exe /C " + command;
     std::vector<char> mutable_command(command_line.begin(), command_line.end());
     mutable_command.push_back('\0');
 
@@ -340,78 +600,143 @@ bool launch_workload(WorkloadExecution& execution, std::string& error) {
         std::ostringstream oss;
         oss << "CreateProcess failed with error " << GetLastError();
         error = oss.str();
-        execution.launch_error = error;
-        execution.exit_reason = "launch-failed";
         return false;
     }
 
-    execution.child.launched = true;
-    execution.child.running = true;
-    execution.child.start_ts_wall = wall_now_ms();
-    execution.child.process_info = process_info;
-    execution.launch_ok = true;
+    child.launched = true;
+    child.running = true;
+    child.start_ts_wall = wall_now_ms();
+    child.process_info = process_info;
     return true;
 #else
     const pid_t pid = fork();
     if (pid < 0) {
         error = "fork failed";
-        execution.launch_error = error;
-        execution.exit_reason = "launch-failed";
         return false;
     }
 
     if (pid == 0) {
-        execl("/bin/sh", "sh", "-lc", execution.workload.command.c_str(), static_cast<char*>(nullptr));
+        execl("/bin/sh", "sh", "-lc", command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
 
-    execution.child.launched = true;
-    execution.child.running = true;
-    execution.child.start_ts_wall = wall_now_ms();
-    execution.child.pid = pid;
-    execution.launch_ok = true;
+    child.launched = true;
+    child.running = true;
+    child.start_ts_wall = wall_now_ms();
+    child.pid = pid;
     return true;
 #endif
 }
 
-void finalize_exit(WorkloadExecution& execution, int exit_code, const std::string& reason) {
-    execution.child.running = false;
-    execution.child.end_ts_wall = wall_now_ms();
-    execution.child.exit_code = exit_code;
-    execution.child.exit_code_valid = true;
-    execution.exit_reason = reason;
+bool launch_program(
+    const std::string& program,
+    const std::vector<std::string>& args,
+    ChildProcess& child,
+    std::string& error) {
+    child = ChildProcess{};
+
+#ifdef _WIN32
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process_info{};
+
+    std::string command_line = join_quoted_command(program, args);
+    std::vector<char> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back('\0');
+
+    const BOOL ok = CreateProcessA(
+        program.c_str(),
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &startup,
+        &process_info);
+    if (ok == FALSE) {
+        std::ostringstream oss;
+        oss << "CreateProcess failed with error " << GetLastError();
+        error = oss.str();
+        return false;
+    }
+
+    child.launched = true;
+    child.running = true;
+    child.start_ts_wall = wall_now_ms();
+    child.process_info = process_info;
+    return true;
+#else
+    const pid_t pid = fork();
+    if (pid < 0) {
+        error = "fork failed";
+        return false;
+    }
+
+    if (pid == 0) {
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 2);
+        argv.push_back(const_cast<char*>(program.c_str()));
+        for (const std::string& arg : args) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+        execvp(program.c_str(), argv.data());
+        _exit(127);
+    }
+
+    child.launched = true;
+    child.running = true;
+    child.start_ts_wall = wall_now_ms();
+    child.pid = pid;
+    return true;
+#endif
 }
 
-void poll_workload(WorkloadExecution& execution) {
-    if (!execution.launch_ok || !execution.child.running) {
-        return;
+void finalize_child_exit(ChildProcess& child, int exit_code) {
+    child.running = false;
+    child.end_ts_wall = wall_now_ms();
+    child.exit_code = exit_code;
+    child.exit_code_valid = true;
+}
+
+enum class ChildPollResult {
+    running,
+    exited,
+    wait_failed,
+};
+
+ChildPollResult poll_child_process(ChildProcess& child) {
+    if (!child.launched || !child.running) {
+        return ChildPollResult::exited;
     }
 
 #ifdef _WIN32
-    const DWORD wait_result = WaitForSingleObject(execution.child.process_info.hProcess, 0);
+    const DWORD wait_result = WaitForSingleObject(child.process_info.hProcess, 0);
     if (wait_result == WAIT_TIMEOUT) {
-        return;
+        return ChildPollResult::running;
     }
 
     DWORD exit_code = 0;
-    if (GetExitCodeProcess(execution.child.process_info.hProcess, &exit_code) == FALSE) {
-        finalize_exit(execution, 1, execution.timed_out ? "timed-out" : "unknown");
-    } else {
-        finalize_exit(
-            execution,
-            static_cast<int>(exit_code),
-            execution.timed_out ? "timed-out" : "completed");
+    if (GetExitCodeProcess(child.process_info.hProcess, &exit_code) == FALSE) {
+        finalize_child_exit(child, 1);
+        close_child_process(child);
+        return ChildPollResult::wait_failed;
     }
-    close_child_process(execution.child);
+
+    finalize_child_exit(child, static_cast<int>(exit_code));
+    close_child_process(child);
+    return ChildPollResult::exited;
 #else
     int status = 0;
-    const pid_t result = waitpid(execution.child.pid, &status, WNOHANG);
+    const pid_t result = waitpid(child.pid, &status, WNOHANG);
     if (result == 0) {
-        return;
+        return ChildPollResult::running;
     }
     if (result < 0) {
-        finalize_exit(execution, 1, execution.timed_out ? "timed-out" : "wait-failed");
-        return;
+        finalize_child_exit(child, 1);
+        return ChildPollResult::wait_failed;
     }
 
     int exit_code = 0;
@@ -422,11 +747,172 @@ void poll_workload(WorkloadExecution& execution) {
     } else {
         exit_code = 1;
     }
-    finalize_exit(
-        execution,
-        exit_code,
-        execution.timed_out ? "timed-out" : "completed");
+    finalize_child_exit(child, exit_code);
+    return ChildPollResult::exited;
 #endif
+}
+
+void stop_child_process(ChildProcess& child, int terminate_code = 1) {
+    if (!child.launched || !child.running) {
+        return;
+    }
+
+#ifdef _WIN32
+    TerminateProcess(child.process_info.hProcess, static_cast<UINT>(terminate_code));
+    WaitForSingleObject(child.process_info.hProcess, 2000);
+    DWORD exit_code = static_cast<DWORD>(terminate_code);
+    GetExitCodeProcess(child.process_info.hProcess, &exit_code);
+    finalize_child_exit(child, static_cast<int>(exit_code));
+    close_child_process(child);
+#else
+    kill(child.pid, SIGTERM);
+    for (int i = 0; i < 20; ++i) {
+        const ChildPollResult result = poll_child_process(child);
+        if (result != ChildPollResult::running) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    kill(child.pid, SIGKILL);
+    for (int i = 0; i < 20; ++i) {
+        const ChildPollResult result = poll_child_process(child);
+        if (result != ChildPollResult::running) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    finalize_child_exit(child, terminate_code);
+#endif
+}
+
+bool wait_for_child_process(ChildProcess& child, uint64_t timeout_ms, std::string& error) {
+    const uint64_t start_ms = wall_now_ms();
+    while (child.running) {
+        const ChildPollResult result = poll_child_process(child);
+        if (result == ChildPollResult::exited) {
+            return true;
+        }
+        if (result == ChildPollResult::wait_failed) {
+            error = "process wait failed";
+            return false;
+        }
+        if (timeout_ms > 0 && wall_now_ms() - start_ms >= timeout_ms) {
+            error = "process wait timed out";
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return true;
+}
+
+bool run_command_sync(
+    const std::string& command,
+    uint64_t timeout_ms,
+    int& exit_code,
+    bool& timed_out,
+    std::string& error) {
+    exit_code = 0;
+    timed_out = false;
+
+    ChildProcess child;
+    if (!launch_child_command(command, child, error)) {
+        exit_code = 1;
+        return false;
+    }
+
+    if (!wait_for_child_process(child, timeout_ms, error)) {
+        timed_out = (error == "process wait timed out");
+        if (child.running) {
+            stop_child_process(child);
+        }
+    }
+
+    if (child.exit_code_valid) {
+        exit_code = child.exit_code;
+    } else if (timed_out) {
+        exit_code = 1;
+    }
+
+    return !timed_out && child.exit_code_valid && child.exit_code == 0;
+}
+
+bool run_program_sync(
+    const std::string& program,
+    const std::vector<std::string>& args,
+    uint64_t timeout_ms,
+    int& exit_code,
+    bool& timed_out,
+    std::string& error) {
+    exit_code = 0;
+    timed_out = false;
+
+    ChildProcess child;
+    if (!launch_program(program, args, child, error)) {
+        exit_code = 1;
+        return false;
+    }
+
+    if (!wait_for_child_process(child, timeout_ms, error)) {
+        timed_out = (error == "process wait timed out");
+        if (child.running) {
+            stop_child_process(child);
+        }
+    }
+
+    if (child.exit_code_valid) {
+        exit_code = child.exit_code;
+    } else if (timed_out) {
+        exit_code = 1;
+    }
+
+    return !timed_out && child.exit_code_valid && child.exit_code == 0;
+}
+
+ReplaySummarySnapshot load_replay_summary_snapshot(const std::filesystem::path& path) {
+    ReplaySummarySnapshot snapshot;
+    const std::string json = read_text_file(path);
+    if (json.empty()) {
+        return snapshot;
+    }
+
+    snapshot.available = true;
+    snapshot.valid = extract_json_bool(json, "valid");
+    snapshot.samples = extract_json_uint64(json, "samples");
+    snapshot.decisions = extract_json_uint64(json, "decisions");
+    snapshot.actions = extract_json_uint64(json, "actions");
+    snapshot.peak_ups = extract_json_double(json, "ups");
+    snapshot.peak_risk_score = extract_json_double(json, "risk_score");
+    snapshot.peak_mem_full_avg10 = extract_json_double(json, "mem_full_avg10");
+    snapshot.peak_vram_used_mb = extract_json_double(json, "vram_used_mb");
+    return snapshot;
+}
+
+bool launch_workload(WorkloadExecution& execution, std::string& error) {
+    execution.launch_attempted = true;
+    execution.launch_error.clear();
+    execution.exit_reason = "running";
+
+    if (!launch_child_command(execution.workload.command, execution.child, error)) {
+        execution.launch_error = error;
+        execution.exit_reason = "launch-failed";
+        return false;
+    }
+
+    execution.launch_ok = true;
+    return true;
+}
+
+void poll_workload(WorkloadExecution& execution) {
+    if (!execution.launch_ok || !execution.child.running) {
+        return;
+    }
+
+    const ChildPollResult result = poll_child_process(execution.child);
+    if (result == ChildPollResult::wait_failed) {
+        execution.exit_reason = execution.timed_out ? "timed-out" : "wait-failed";
+    } else if (result == ChildPollResult::exited) {
+        execution.exit_reason = execution.timed_out ? "timed-out" : "completed";
+    }
 }
 
 void stop_workload(WorkloadExecution& execution, const std::string& reason) {
@@ -436,34 +922,8 @@ void stop_workload(WorkloadExecution& execution, const std::string& reason) {
 
     execution.forced_stop = true;
     execution.timed_out = (reason == "timed-out");
-
-#ifdef _WIN32
-    TerminateProcess(execution.child.process_info.hProcess, 1);
-    WaitForSingleObject(execution.child.process_info.hProcess, 2000);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(execution.child.process_info.hProcess, &exit_code);
-    finalize_exit(execution, static_cast<int>(exit_code), reason);
-    close_child_process(execution.child);
-#else
-    kill(execution.child.pid, SIGTERM);
-    for (int i = 0; i < 20; ++i) {
-        poll_workload(execution);
-        if (!execution.child.running) {
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    kill(execution.child.pid, SIGKILL);
-    for (int i = 0; i < 20; ++i) {
-        poll_workload(execution);
-        if (!execution.child.running) {
-            execution.exit_reason = reason;
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    finalize_exit(execution, 1, reason);
-#endif
+    stop_child_process(execution.child);
+    execution.exit_reason = reason;
 }
 
 ExecutionSummary execute_benchmark(
@@ -483,8 +943,7 @@ ExecutionSummary execute_benchmark(
         }
     }
 
-    const uint64_t run_window_ms =
-        static_cast<uint64_t>(std::max(0, scenario.warmup_s + scenario.measurement_s)) * 1000ull;
+    const uint64_t run_window_ms = benchmark_window_ms(scenario);
 
     while (true) {
         bool any_running = false;
@@ -546,11 +1005,121 @@ ExecutionSummary execute_benchmark(
     return summary;
 }
 
+bool start_hermes_execution(
+    const hermes::BenchmarkScenario& scenario,
+    const std::string& artifact_root,
+    const std::string& bench_run_id,
+    const std::string& hermes_bin,
+    HermesExecution& execution,
+    std::string& error) {
+    execution.requested = true;
+    execution.hermes_bin = hermes_bin;
+    execution.run_id = bench_run_id + "-hermes";
+    execution.run_directory =
+        (std::filesystem::path(artifact_root) / "logs" / execution.run_id).string();
+
+    const std::vector<std::pair<std::string, std::string>> overrides = {
+        {"HERMES_RUN_ID", execution.run_id},
+        {"HERMES_SCENARIO", scenario.name},
+        {"HERMES_RUNTIME_MODE", scenario.runtime_mode},
+        {"HERMES_ARTIFACT_ROOT", artifact_root},
+        {"HERMES_MAX_LOOPS", std::to_string(hermes_loop_budget(scenario))},
+    };
+
+    std::string env_error;
+    const std::vector<EnvRecord> previous = apply_environment_overrides(overrides, env_error);
+    if (!env_error.empty()) {
+        error = env_error;
+        execution.launch_error = env_error;
+        return false;
+    }
+
+    const bool launched = launch_program(hermes_bin, {}, execution.child, error);
+    restore_environment_overrides(previous);
+
+    if (!launched) {
+        execution.launch_error = error;
+        return false;
+    }
+
+    execution.launch_ok = true;
+    return true;
+}
+
+bool run_hermes_replay(
+    HermesExecution& execution,
+    const std::string& artifact_root,
+    ReplaySummarySnapshot& snapshot,
+    std::string& error) {
+    execution.replay_attempted = true;
+    execution.replay_summary_path =
+        std::filesystem::path(execution.run_directory) / "replay_summary.json";
+    execution.replay_csv_path =
+        std::filesystem::path(execution.run_directory) / "summary.csv";
+
+    if (!std::filesystem::exists(execution.run_directory)) {
+        error = "Hermes run directory was not written: " + execution.run_directory;
+        execution.replay_error = error;
+        return false;
+    }
+
+    bool timed_out = false;
+    int exit_code = 0;
+    const bool replay_ok = run_program_sync(
+        execution.replay_bin,
+        {execution.run_directory, artifact_root},
+        20000,
+        exit_code,
+        timed_out,
+        error);
+    execution.replay_exit_code = exit_code;
+    execution.replay_exit_code_valid = true;
+
+    if (std::filesystem::exists(execution.replay_summary_path)) {
+        snapshot = load_replay_summary_snapshot(execution.replay_summary_path);
+    }
+
+    if (!std::filesystem::exists(execution.replay_summary_path)) {
+        if (error.empty()) {
+            error = "Hermes replay summary was not written: " +
+                    execution.replay_summary_path.string();
+        }
+        execution.replay_error = error;
+        return false;
+    }
+
+    if (!std::filesystem::exists(execution.replay_csv_path)) {
+        if (error.empty()) {
+            error = "Hermes replay CSV was not written: " +
+                    execution.replay_csv_path.string();
+        }
+        execution.replay_error = error;
+        return false;
+    }
+
+    if (!replay_ok) {
+        if (error.empty()) {
+            if (timed_out) {
+                error = "Hermes replay timed out";
+            } else {
+                error = "Hermes replay exited with code " + std::to_string(exit_code);
+            }
+        }
+        execution.replay_error = error;
+        return false;
+    }
+
+    execution.replay_ok = true;
+    return true;
+}
+
 bool write_execution_summary(
     const hermes::BenchmarkScenario& scenario,
     const PlanValidation& validation,
     const ExecutionSummary& summary,
     const std::vector<WorkloadExecution>& executions,
+    const HermesExecution& hermes_execution,
+    const ReplaySummarySnapshot& replay_snapshot,
     const std::string& artifact_root,
     const std::string& run_id,
     const std::filesystem::path& plan_path,
@@ -600,6 +1169,41 @@ bool write_execution_summary(
         << "  \"exited_nonzero\": " << summary.exited_nonzero << ",\n"
         << "  \"still_running\": " << summary.still_running << ",\n"
         << "  \"notes\": " << string_array_json(notes) << ",\n"
+        << "  \"hermes\": {\n"
+        << "    \"requested\": " << bool_json(hermes_execution.requested) << ",\n"
+        << "    \"launch_ok\": " << bool_json(hermes_execution.launch_ok) << ",\n"
+        << "    \"binary\": \"" << json_escape(hermes_execution.hermes_bin) << "\",\n"
+        << "    \"run_id\": \"" << json_escape(hermes_execution.run_id) << "\",\n"
+        << "    \"run_directory\": \"" << json_escape(hermes_execution.run_directory) << "\",\n"
+        << "    \"exit_code\": "
+        << (hermes_execution.child.exit_code_valid
+                ? std::to_string(hermes_execution.child.exit_code)
+                : "null")
+        << ",\n"
+        << "    \"launch_error\": \"" << json_escape(hermes_execution.launch_error) << "\",\n"
+        << "    \"replay_attempted\": " << bool_json(hermes_execution.replay_attempted) << ",\n"
+        << "    \"replay_ok\": " << bool_json(hermes_execution.replay_ok) << ",\n"
+        << "    \"replay_binary\": \"" << json_escape(hermes_execution.replay_bin) << "\",\n"
+        << "    \"replay_exit_code\": "
+        << (hermes_execution.replay_exit_code_valid
+                ? std::to_string(hermes_execution.replay_exit_code)
+                : "null")
+        << ",\n"
+        << "    \"replay_summary\": \"" << json_escape(hermes_execution.replay_summary_path.string()) << "\",\n"
+        << "    \"replay_csv\": \"" << json_escape(hermes_execution.replay_csv_path.string()) << "\",\n"
+        << "    \"replay_error\": \"" << json_escape(hermes_execution.replay_error) << "\"\n"
+        << "  },\n"
+        << "  \"replay_snapshot\": {\n"
+        << "    \"available\": " << bool_json(replay_snapshot.available) << ",\n"
+        << "    \"valid\": " << bool_json(replay_snapshot.valid) << ",\n"
+        << "    \"samples\": " << replay_snapshot.samples << ",\n"
+        << "    \"decisions\": " << replay_snapshot.decisions << ",\n"
+        << "    \"actions\": " << replay_snapshot.actions << ",\n"
+        << "    \"peak_ups\": " << replay_snapshot.peak_ups << ",\n"
+        << "    \"peak_risk_score\": " << replay_snapshot.peak_risk_score << ",\n"
+        << "    \"peak_mem_full_avg10\": " << replay_snapshot.peak_mem_full_avg10 << ",\n"
+        << "    \"peak_vram_used_mb\": " << replay_snapshot.peak_vram_used_mb << "\n"
+        << "  },\n"
         << "  \"workloads\": [\n";
 
     for (std::size_t i = 0; i < executions.size(); ++i) {
@@ -729,6 +1333,8 @@ int main(int argc, char* argv[]) {
                   << "  --dry-run           Print plan without launching workloads\n"
                   << "  --artifact-root DIR Artifact root for plan output (default: $HERMES_ARTIFACT_ROOT or artifacts)\n"
                   << "  --run-id ID         Run id for plan artifacts (default: generated from scenario name)\n"
+                  << "  --hermes-bin PATH   Optional hermesd path for observe/advisory/active runs\n"
+                  << "  --replay-bin PATH   Optional hermes_replay path for observe/advisory/active runs\n"
                   << "  --generate-baseline Write a default baseline scenario config\n"
                   << "  --generate-active   Write a default active-control scenario config\n";
         return args.empty() ? 1 : 0;
@@ -775,6 +1381,13 @@ int main(int argc, char* argv[]) {
         run_id = default_run_id(scenario);
     }
 
+    const std::filesystem::path current_executable =
+        argc > 0 ? std::filesystem::path(argv[0]) : std::filesystem::path();
+    std::string hermes_bin_override;
+    std::string replay_bin_override;
+    option_value(args, "--hermes-bin", hermes_bin_override);
+    option_value(args, "--replay-bin", replay_bin_override);
+
     std::filesystem::path plan_path;
     std::filesystem::path scenario_snapshot_path;
     if (!write_plan_artifacts(
@@ -814,6 +1427,35 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    HermesExecution hermes_execution;
+    ReplaySummarySnapshot replay_snapshot;
+    bool overall_ok = true;
+
+    if (runtime_mode_uses_hermes(scenario.runtime_mode)) {
+        hermes_execution.hermes_bin =
+            resolve_binary_path(hermes_bin_override, current_executable, "hermesd");
+        hermes_execution.replay_bin =
+            resolve_binary_path(replay_bin_override, current_executable, "hermes_replay");
+
+        if (!start_hermes_execution(
+                scenario,
+                artifact_root,
+                run_id,
+                hermes_execution.hermes_bin,
+                hermes_execution,
+                error)) {
+            std::cerr << "hermes_bench: failed to launch Hermes daemon: " << error << std::endl;
+            return 1;
+        }
+
+        std::cout << "Hermes binary    : " << hermes_execution.hermes_bin
+                  << "\nReplay binary    : " << hermes_execution.replay_bin
+                  << "\nHermes run id    : " << hermes_execution.run_id
+                  << "\nHermes run dir   : " << hermes_execution.run_directory << "\n";
+    } else {
+        std::cout << "Hermes runtime   : disabled for baseline mode\n";
+    }
+
     std::vector<WorkloadExecution> executions;
     executions.reserve(scenario.workloads.size());
     for (const hermes::BenchmarkWorkload& workload : scenario.workloads) {
@@ -822,13 +1464,41 @@ int main(int argc, char* argv[]) {
         executions.push_back(execution);
     }
 
-    const ExecutionSummary summary = execute_benchmark(scenario, executions);
+    ExecutionSummary summary = execute_benchmark(scenario, executions);
+
+    if (hermes_execution.launch_ok) {
+        std::string hermes_wait_error;
+        if (!wait_for_child_process(hermes_execution.child, 4000, hermes_wait_error)) {
+            if (hermes_execution.child.running) {
+                stop_child_process(hermes_execution.child);
+                summary.notes.push_back("Hermes daemon exceeded shutdown wait and was terminated");
+            } else {
+                summary.notes.push_back("Hermes daemon wait error: " + hermes_wait_error);
+            }
+            overall_ok = false;
+        }
+
+        if (hermes_execution.child.exit_code_valid && hermes_execution.child.exit_code != 0) {
+            summary.notes.push_back(
+                "Hermes daemon exited with code " +
+                std::to_string(hermes_execution.child.exit_code));
+            overall_ok = false;
+        }
+
+        if (!run_hermes_replay(hermes_execution, artifact_root, replay_snapshot, error)) {
+            summary.notes.push_back("Hermes replay failed: " + error);
+            overall_ok = false;
+        }
+    }
+
     std::filesystem::path summary_path;
     if (!write_execution_summary(
             scenario,
             validation,
             summary,
             executions,
+            hermes_execution,
+            replay_snapshot,
             artifact_root,
             run_id,
             plan_path,
@@ -845,7 +1515,20 @@ int main(int argc, char* argv[]) {
               << "\nJobs completed   : " << summary.jobs_completed
               << "\nTimed out        : " << summary.timed_out
               << "\nExited nonzero   : " << summary.exited_nonzero
-              << "\nRun duration ms  : " << summary.duration_ms << "\n";
+              << "\nRun duration ms  : " << summary.duration_ms;
 
-    return 0;
+    if (hermes_execution.requested) {
+        std::cout << "\nHermes exit code : "
+                  << (hermes_execution.child.exit_code_valid
+                          ? std::to_string(hermes_execution.child.exit_code)
+                          : "n/a")
+                  << "\nReplay summary   : " << hermes_execution.replay_summary_path.string()
+                  << "\nReplay valid     : " << (replay_snapshot.valid ? "true" : "false")
+                  << "\nReplay samples   : " << replay_snapshot.samples
+                  << "\nReplay decisions : " << replay_snapshot.decisions
+                  << "\nReplay actions   : " << replay_snapshot.actions;
+    }
+    std::cout << "\n";
+
+    return overall_ok ? 0 : 1;
 }

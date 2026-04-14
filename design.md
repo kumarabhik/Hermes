@@ -1547,3 +1547,43 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/bench/codex-bench-launch-20260414-plan.json`
   - `artifacts/bench/codex-bench-launch-20260414-scenario.yaml`
   - `artifacts/bench/codex-bench-launch-20260414-summary.json`
+
+#### 2026-04-15 IST - Benchmark Hermes Replay Orchestration Pass
+- Verified repo facts:
+  - `src/cli/hermes_bench.cpp` now treats `baseline` as a first-class benchmark runtime mode and only launches Hermes for non-baseline runs.
+  - `hermes_bench` now accepts `--hermes-bin` and `--replay-bin` overrides, resolves sibling binaries by default, launches `hermesd` for non-baseline scenarios, waits for the Hermes run to finish, and then invokes `hermes_replay` on the generated run directory.
+  - The benchmark summary artifact now records Hermes launch status, Hermes/replay binary paths, the Hermes run id and run directory, replay exit status, replay output paths, and an embedded replay snapshot with `samples`, `decisions`, `actions`, `peak_ups`, `peak_risk_score`, `peak_mem_full_avg10`, and `peak_vram_used_mb`.
+  - `include/hermes/runtime/scenario_config.hpp` and `src/runtime/scenario_config.cpp` now expose `baseline` as the default no-Hermes scenario mode.
+  - Added `scripts/smoke_benchmark_hermes.ps1`.
+  - The new smoke script builds `hermes_bench`, `hermesd`, and `hermes_replay` with direct `g++`, runs a short four-workload `observe-only` benchmark scenario, verifies the Hermes run directory and replay outputs, and checks that the benchmark summary embeds replay snapshot fields.
+  - `scripts/smoke_benchmark_launch.ps1` now uses `runtime_mode: baseline` so it remains a launch-only harness smoke instead of implicitly depending on Hermes binaries.
+  - `README.md` now documents the benchmark-plus-Hermes smoke script and clarifies the difference between `baseline` and `observe-only` benchmark scenarios.
+  - `roadmap.md` now records benchmark harness Hermes orchestration and partial observe-only benchmark coverage.
+  - Running `.\scripts\smoke_benchmark_hermes.ps1 -RunId codex-bench-hermes-20260415c` succeeded.
+  - The verified orchestration smoke run recorded `launched=4`, `jobs_completed=3`, `timed_out=1`, `replay_samples=6`, `replay_decisions=6`, `replay_actions=6`, and `replay_valid=true`.
+- Decisions made:
+  - Split baseline benchmark mode from observe-only mode so benchmark intent is explicit: `baseline` means no Hermes process, while `observe-only` means Hermes is running but not mutating the host.
+  - Kept workload launch through the shell, but launched `hermesd` and `hermes_replay` as direct child processes to avoid Windows `cmd /C` quoting edge cases for exact binary-plus-argument execution.
+  - Embedded a small replay snapshot directly into the benchmark summary so future comparison tooling can read one artifact without re-opening multiple per-run files first.
+- Assumptions still in force:
+  - This slice proves bounded Hermes orchestration plus replay capture, not benchmark impact claims.
+  - The benchmark harness still does not collect real foreground latency, OOM counts, `strace`, or `perf` evidence.
+  - Direct `g++` smoke verification remains the local path until CMake is available in the authoring shell.
+- Open risks:
+  - The new benchmark Hermes smoke is PowerShell-oriented and assumes `g++` is on PATH.
+  - Observe-only benchmark output currently embeds replay peaks and counts, but it does not yet compute comparison tables across baseline versus observe-only versus active-control runs.
+  - Active-control benchmark claims still need Linux-native verification with real controllable workloads.
+- Next recommended actions:
+  - Add comparison-friendly benchmark summary fields for OOM count, completion-rate targets, and degraded-behavior notes derived from generated artifacts.
+  - Add a benchmark summary aggregator that reads multiple benchmark JSON files and produces baseline versus observe-only versus active-control comparison tables.
+  - Start saving at least one real Linux benchmark bundle with Hermes observe-only mode in the loop.
+- Evidence paths / artifacts:
+  - `include/hermes/runtime/scenario_config.hpp`
+  - `src/runtime/scenario_config.cpp`
+  - `src/cli/hermes_bench.cpp`
+  - `scripts/smoke_benchmark_launch.ps1`
+  - `scripts/smoke_benchmark_hermes.ps1`
+  - `README.md`
+  - `roadmap.md`
+  - `artifacts/bench/codex-bench-hermes-20260415c-summary.json`
+  - `artifacts/logs/codex-bench-hermes-20260415c-hermes/replay_summary.json`

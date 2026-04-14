@@ -153,7 +153,7 @@ bool ScenarioConfigLoader::save(
 BenchmarkScenario ScenarioConfigLoader::default_baseline() {
     BenchmarkScenario s;
     s.name = "baseline-no-hermes";
-    s.runtime_mode = "observe-only";
+    s.runtime_mode = "baseline";
     s.warmup_s = 10;
     s.measurement_s = 120;
     s.repeat_count = 5;

@@ -18,7 +18,7 @@ struct BenchmarkWorkload {
 // Each scenario should produce one run directory under artifacts/logs/<run_id>/.
 struct BenchmarkScenario {
     std::string name;               // scenario identifier (used as HERMES_SCENARIO)
-    std::string runtime_mode;       // "observe-only", "advisory", or "active-control"
+    std::string runtime_mode;       // "baseline", "observe-only", "advisory", or "active-control"
     int warmup_s{10};               // seconds to wait before starting measurement
     int measurement_s{60};          // total measurement window
     int repeat_count{5};            // how many times to run this scenario

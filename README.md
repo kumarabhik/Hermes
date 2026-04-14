@@ -99,7 +99,7 @@ To smoke-check benchmark scenario planning without launching real workloads:
 .\scripts\smoke_benchmark_plan.ps1
 ```
 
-That script builds `hermes_bench`, generates a default baseline scenario, runs a dry-run benchmark plan, and verifies the plan JSON plus scenario snapshot under `artifacts/bench/`.
+That script builds `hermes_bench`, generates a default `baseline` scenario, runs a dry-run benchmark plan, and verifies the plan JSON plus scenario snapshot under `artifacts/bench/`.
 
 To smoke-check bounded benchmark workload launch and summary writing:
 
@@ -107,4 +107,12 @@ To smoke-check bounded benchmark workload launch and summary writing:
 .\scripts\smoke_benchmark_launch.ps1
 ```
 
-That script builds `hermes_bench`, runs a short four-workload benchmark scenario with local commands, verifies the plan and scenario snapshot, and checks the benchmark run summary under `artifacts/bench/`.
+That script builds `hermes_bench`, runs a short four-workload `baseline` scenario with local commands, verifies the plan and scenario snapshot, and checks the benchmark run summary under `artifacts/bench/`.
+
+To smoke-check a benchmark run with Hermes in observe-only mode plus replay capture:
+
+```powershell
+.\scripts\smoke_benchmark_hermes.ps1
+```
+
+That script builds `hermes_bench`, `hermesd`, and `hermes_replay`, runs a short four-workload `observe-only` scenario, verifies the Hermes run directory under `artifacts/logs/`, and checks that the benchmark summary embeds replay counts and peak fields from the replay output.

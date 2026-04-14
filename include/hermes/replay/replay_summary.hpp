@@ -75,6 +75,10 @@ public:
         const ReplaySummary& summary,
         const std::filesystem::path& output_path,
         std::string& error) const;
+    bool write_summary_csv(
+        const ReplaySummary& summary,
+        const std::filesystem::path& output_path,
+        std::string& error) const;
 
 private:
     void read_samples(const std::filesystem::path& run_directory, ReplaySummary& summary) const;
@@ -89,5 +93,7 @@ private:
 };
 
 std::string replay_summary_json(const ReplaySummary& summary);
+std::string replay_summary_csv_header();
+std::string replay_summary_csv_row(const ReplaySummary& summary);
 
 } // namespace hermes

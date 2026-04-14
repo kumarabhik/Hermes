@@ -1400,3 +1400,77 @@ This section exists to keep future sessions grounded in verified state instead o
   - `scripts/smoke_synthetic_replay.ps1`
   - `README.md`
   - `roadmap.md`
+
+#### 2026-04-14 IST - Replay Summary CSV Pass
+- Verified repo facts:
+  - `include/hermes/replay/replay_summary.hpp` now exposes CSV summary writing and CSV row serialization helpers.
+  - `src/replay/replay_summary.cpp` now writes a compact one-row CSV with run identity, artifact counts, time window, pressure/risk peaks, pressure/risk/state/action counts, artifact presence flags, assertion counts, and warning/failure counts.
+  - `src/cli/hermes_replay.cpp` now writes `summary.csv` beside the run directory and copies CSV summaries to `artifacts/replay/<run_id>-summary.csv` and `artifacts/summaries/<run_id>-summary.csv`.
+  - `scripts/smoke_synthetic_replay.ps1` now verifies the run CSV and artifact CSV copy, checks matching `run_id`, requires `valid=true`, and fails if CSV assertion failures are nonzero.
+  - `README.md` documents the JSON and CSV summary outputs, and `roadmap.md` records replay JSON/CSV summary behavior.
+  - Running `.\scripts\smoke_synthetic_replay.ps1 -RunId codex-summary-csv-20260414` succeeded with `assertions=17/17`, `peak_ups=96.1`, and `peak_risk=1`.
+  - The smoke run wrote `artifacts/logs/codex-summary-csv-20260414/summary.csv`, `artifacts/replay/codex-summary-csv-20260414-summary.csv`, and `artifacts/summaries/codex-summary-csv-20260414-summary.csv`.
+  - `cmake` is still unavailable in this PowerShell environment, so verification used the direct `g++` smoke path.
+- Decisions made:
+  - Kept the per-run CSV as a single header plus one data row so fixture and future benchmark tools can consume it without parsing nested JSON.
+  - Copied CSVs to both `artifacts/replay/` and `artifacts/summaries/` to match the existing JSON summary discovery pattern.
+  - Limited this CSV to replay-observed fields; real OOM counts, foreground latency, jobs completed, and degraded-behavior notes still belong to the benchmark harness/reporting layer.
+- Assumptions still in force:
+  - Generated CSV and JSON summaries remain ignored artifacts unless a future evidence bundle intentionally tracks selected outputs.
+  - Synthetic fixture verification is regression evidence for replay behavior, not live benchmark proof.
+  - The CMake build path still needs verification in an environment where CMake is installed.
+- Open risks:
+  - The CSV schema is intentionally compact and may need extension when real benchmark metrics are available.
+  - The PowerShell smoke script still assumes `g++` is available on PATH.
+  - There is not yet a Linux shell smoke script or CTest target for replay CSV verification.
+- Next recommended actions:
+  - Add a daemon one-loop smoke script that verifies live observe artifact generation and replay CSV creation.
+  - Add a Linux shell smoke wrapper or CTest target once CMake is available.
+  - Continue the benchmark harness so required benchmark table fields like OOM count, latency, jobs completed, and notes become artifact-backed.
+- Evidence paths / artifacts:
+  - `include/hermes/replay/replay_summary.hpp`
+  - `src/replay/replay_summary.cpp`
+  - `src/cli/hermes_replay.cpp`
+  - `scripts/smoke_synthetic_replay.ps1`
+  - `README.md`
+  - `roadmap.md`
+  - `artifacts/logs/codex-summary-csv-20260414/replay_summary.json`
+  - `artifacts/logs/codex-summary-csv-20260414/summary.csv`
+  - `artifacts/replay/codex-summary-csv-20260414-summary.csv`
+  - `artifacts/summaries/codex-summary-csv-20260414-summary.csv`
+
+#### 2026-04-14 IST - One-Loop Daemon Replay Smoke Pass
+- Verified repo facts:
+  - Added `scripts/smoke_daemon_replay.ps1`.
+  - The script builds `hermesd` and `hermes_replay` with direct `g++` commands, runs `hermesd` with `HERMES_MAX_LOOPS=1`, `HERMES_RUNTIME_MODE=observe-only`, and `HERMES_SCENARIO=daemon-smoke`, then replays the daemon run directory.
+  - The script verifies daemon artifacts are present: `run_metadata.json`, `config_snapshot.yaml`, `telemetry_quality.json`, `samples.ndjson`, `processes.ndjson`, `scores.ndjson`, `predictions.ndjson`, `decisions.ndjson`, `actions.ndjson`, and `events.ndjson`.
+  - The script verifies non-empty daemon artifacts for metadata, telemetry, samples, scores, predictions, decisions, actions, and events. `processes.ndjson` may be empty when no processes are mapped in the smoke environment.
+  - The script verifies replay JSON and CSV outputs in the run directory and in `artifacts/summaries/`.
+  - `README.md` now documents both the synthetic replay smoke script and the daemon replay smoke script.
+  - `roadmap.md` now records local `g++` smoke verification for both synthetic replay and one-loop daemon replay.
+  - Running `.\scripts\smoke_daemon_replay.ps1 -RunId codex-daemon-smoke-20260414` succeeded.
+  - The verified daemon smoke run had `samples=1`, `decisions=1`, `actions=1`, `valid=true`, `peak_ups=0`, and `peak_risk=0` in this Windows authoring environment.
+- Decisions made:
+  - Kept the daemon smoke script separate from the synthetic fixture script because one validates deterministic policy coverage while the other validates live daemon artifact plumbing.
+  - Used observe-only mode and `HERMES_MAX_LOOPS=1` so the script is safe and bounded by default.
+  - Treated empty `processes.ndjson` as acceptable for the smoke script because this environment may not expose Linux `/proc` process details.
+- Assumptions still in force:
+  - This smoke test validates daemon artifact generation and replay parsing, not real pressure behavior or benchmark impact.
+  - Direct `g++` verification remains the local path until CMake is available.
+  - Generated smoke artifacts remain ignored by git.
+- Open risks:
+  - The script currently targets PowerShell and assumes `g++` is on PATH.
+  - The one-loop smoke run does not exercise scheduler pressure transitions.
+  - Native Linux verification is still needed for real PSI, `/proc`, and active-control paths.
+- Next recommended actions:
+  - Add a Linux shell equivalent or CTest wrapper once CMake can be exercised.
+  - Start extending `hermes_bench` from config validation into bounded workload launching.
+  - Add benchmark artifact checks for OOM count, latency, jobs completed, and degraded-behavior notes.
+- Evidence paths / artifacts:
+  - `scripts/smoke_daemon_replay.ps1`
+  - `README.md`
+  - `roadmap.md`
+  - `artifacts/logs/codex-daemon-smoke-20260414/replay_summary.json`
+  - `artifacts/logs/codex-daemon-smoke-20260414/summary.csv`
+  - `artifacts/logs/codex-daemon-smoke-20260414/telemetry_quality.json`
+  - `artifacts/summaries/codex-daemon-smoke-20260414-summary.csv`

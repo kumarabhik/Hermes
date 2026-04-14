@@ -19,7 +19,7 @@ void print_usage() {
     std::cout << "Usage: hermes_replay <run-directory> [artifact-root]\n"
               << "\n"
               << "Summarizes Hermes NDJSON artifacts from a daemon run directory.\n"
-              << "Writes replay_summary.json beside the run and copies the summary to artifacts/replay/ and artifacts/summaries/.\n";
+              << "Writes replay_summary.json and summary.csv beside the run and copies summaries to artifacts/replay/ and artifacts/summaries/.\n";
 }
 
 } // namespace
@@ -47,6 +47,14 @@ int main(int argc, char** argv) {
 
     std::filesystem::path replay_summary_path;
     std::filesystem::path artifact_summary_path;
+    std::filesystem::path run_csv_path = run_directory / "summary.csv";
+    if (!builder.write_summary_csv(summary, run_csv_path, error)) {
+        std::cerr << "Failed to write run summary CSV: " << error << std::endl;
+        return 2;
+    }
+
+    std::filesystem::path replay_csv_path;
+    std::filesystem::path artifact_csv_path;
     if (!summary.run_id.empty()) {
         replay_summary_path = artifact_root / "replay" / (summary.run_id + "-summary.json");
         if (!builder.write_summary(summary, replay_summary_path, error)) {
@@ -54,9 +62,21 @@ int main(int argc, char** argv) {
             return 2;
         }
 
+        replay_csv_path = artifact_root / "replay" / (summary.run_id + "-summary.csv");
+        if (!builder.write_summary_csv(summary, replay_csv_path, error)) {
+            std::cerr << "Failed to write replay summary CSV copy: " << error << std::endl;
+            return 2;
+        }
+
         artifact_summary_path = artifact_root / "summaries" / (summary.run_id + "-summary.json");
         if (!builder.write_summary(summary, artifact_summary_path, error)) {
             std::cerr << "Failed to write artifact summary copy: " << error << std::endl;
+            return 2;
+        }
+
+        artifact_csv_path = artifact_root / "summaries" / (summary.run_id + "-summary.csv");
+        if (!builder.write_summary_csv(summary, artifact_csv_path, error)) {
+            std::cerr << "Failed to write artifact summary CSV copy: " << error << std::endl;
             return 2;
         }
     }
@@ -71,11 +91,18 @@ int main(int argc, char** argv) {
               << " peak_risk=" << summary.peak_risk_score
               << std::endl;
     std::cout << "Wrote " << run_summary_path.string() << std::endl;
+    std::cout << "Wrote " << run_csv_path.string() << std::endl;
     if (!replay_summary_path.empty()) {
         std::cout << "Wrote " << replay_summary_path.string() << std::endl;
     }
+    if (!replay_csv_path.empty()) {
+        std::cout << "Wrote " << replay_csv_path.string() << std::endl;
+    }
     if (!artifact_summary_path.empty()) {
         std::cout << "Wrote " << artifact_summary_path.string() << std::endl;
+    }
+    if (!artifact_csv_path.empty()) {
+        std::cout << "Wrote " << artifact_csv_path.string() << std::endl;
     }
 
     if (!summary.warnings.empty()) {

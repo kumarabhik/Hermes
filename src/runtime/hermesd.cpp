@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "hermes/actions/active_executor.hpp"
 #include "hermes/actions/dry_run_executor.hpp"
 #include "hermes/core/types.hpp"
 #include "hermes/engine/predictor.hpp"
@@ -16,8 +17,10 @@
 #include "hermes/engine/scheduler.hpp"
 #include "hermes/monitor/cpu_psi.hpp"
 #include "hermes/monitor/gpu_stats.hpp"
+#include "hermes/monitor/io_psi.hpp"
 #include "hermes/monitor/loadavg.hpp"
 #include "hermes/monitor/mem_psi.hpp"
+#include "hermes/monitor/vmstat.hpp"
 #include "hermes/profiler/process_mapper.hpp"
 #include "hermes/profiler/workload_classifier.hpp"
 #include "hermes/runtime/event_logger.hpp"
@@ -83,6 +86,16 @@ std::string env_or(const char* name, const std::string& fallback) {
         return fallback;
     }
     return value;
+}
+
+OperatingMode parse_runtime_mode(const std::string& mode_str) {
+    if (mode_str == "active-control") {
+        return OperatingMode::ActiveControl;
+    }
+    if (mode_str == "advisory") {
+        return OperatingMode::Advisory;
+    }
+    return OperatingMode::ObserveOnly;
 }
 
 uint64_t parse_max_loops() {
@@ -182,6 +195,9 @@ int main() {
     std::cout << "Starting Hermes Daemon (hermesd)..." << std::endl;
     std::cout << "Observation mode: enabled" << std::endl;
 
+    const std::string runtime_mode_str = env_or("HERMES_RUNTIME_MODE", "observe-only");
+    const OperatingMode runtime_mode = parse_runtime_mode(runtime_mode_str);
+
     EventLoggerConfig event_logger_config;
     event_logger_config.artifact_root = env_or("HERMES_ARTIFACT_ROOT", "artifacts");
     event_logger_config.run_id = env_or("HERMES_RUN_ID", make_run_id());
@@ -195,8 +211,10 @@ int main() {
     telemetry_quality_config.scenario = event_logger_config.scenario;
     telemetry_quality_config.config_hash = event_logger_config.config_hash;
 
+    std::cout << "Runtime mode: " << runtime_mode_str << std::endl;
+
     if (event_logger.open()) {
-        event_logger.log_run_start("observe-only");
+        event_logger.log_run_start(runtime_mode_str);
         std::cout << "Artifact logging: " << event_logger.run_directory().string() << std::endl;
         telemetry_quality_config.run_directory = event_logger.run_directory();
 
@@ -207,7 +225,7 @@ int main() {
         metadata_config.run_id = event_logger_config.run_id;
         metadata_config.scenario = event_logger_config.scenario;
         metadata_config.config_hash = event_logger_config.config_hash;
-        metadata_config.runtime_mode = "observe-only";
+        metadata_config.runtime_mode = runtime_mode_str;
 
         RunMetadataWriter metadata_writer;
         std::string metadata_error;
@@ -234,14 +252,18 @@ int main() {
 
     CpuPsiMonitor cpu_monitor;
     MemPsiMonitor mem_monitor;
+    IoPsiMonitor io_monitor;
     LoadAvgMonitor loadavg_monitor;
     GpuStatsCollector gpu_collector;
+    VmstatMonitor vmstat_monitor;
     ProcessMapper process_mapper;
     WorkloadClassifier workload_classifier;
     PressureScoreCalculator pressure_score_calculator;
     OomPredictor predictor;
-    Scheduler scheduler;
-    DryRunExecutor dry_run_executor;
+    SchedulerConfig scheduler_config;
+    scheduler_config.mode = runtime_mode;
+    Scheduler scheduler(scheduler_config);
+    ActiveExecutor active_executor;
 
     std::vector<ProcessSnapshot> last_processes;
     auto next_process_refresh = std::chrono::steady_clock::now();
@@ -253,9 +275,11 @@ int main() {
 
         const bool cpu_ok = cpu_monitor.update_sample(current_sample);
         const bool mem_ok = mem_monitor.update_sample(current_sample);
+        const bool io_ok = io_monitor.update_sample(current_sample);
         const bool loadavg_ok = loadavg_monitor.update_sample(current_sample);
         const bool gpu_ok = gpu_collector.update_sample(current_sample);
-        event_logger.log_sample(current_sample, cpu_ok, mem_ok, loadavg_ok, gpu_ok);
+        const bool vmstat_ok = vmstat_monitor.update_sample(current_sample);
+        event_logger.log_sample(current_sample, cpu_ok, mem_ok, loadavg_ok, gpu_ok, io_ok, vmstat_ok);
 
         bool refreshed_processes = false;
         const auto now = std::chrono::steady_clock::now();
@@ -285,7 +309,13 @@ int main() {
         const PressureScore score = pressure_score_calculator.compute(current_sample);
         const RiskPrediction prediction = predictor.update(current_sample, last_processes, score);
         const InterventionDecision decision = scheduler.evaluate(score, prediction, last_processes);
-        const InterventionResult result = dry_run_executor.execute(decision);
+        const InterventionResult result = active_executor.execute(decision);
+
+        // On recovery, release any paused processes
+        if (decision.scheduler_state_changed &&
+            decision.scheduler_state == SchedulerState::Recovery) {
+            active_executor.throttle_action().resume_all(decision.ts_mono);
+        }
         event_logger.log_score(score);
         event_logger.log_prediction(prediction);
         event_logger.log_decision(score, prediction, decision);

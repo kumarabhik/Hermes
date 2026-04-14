@@ -6,6 +6,7 @@
 #include <cctype>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iterator>
 #include <sstream>
 #include <unordered_set>
@@ -498,6 +499,35 @@ std::string string_vector_json(const std::vector<std::string>& values) {
     return oss.str();
 }
 
+std::string csv_escape(const std::string& value) {
+    const bool needs_quotes =
+        value.find_first_of(",\"\r\n") != std::string::npos;
+    if (!needs_quotes) {
+        return value;
+    }
+
+    std::ostringstream oss;
+    oss << '"';
+    for (const char ch : value) {
+        if (ch == '"') {
+            oss << "\"\"";
+        } else {
+            oss << ch;
+        }
+    }
+    oss << '"';
+    return oss.str();
+}
+
+std::size_t count_for(const std::map<std::string, std::size_t>& values, const std::string& key) {
+    const auto it = values.find(key);
+    return it == values.end() ? 0 : it->second;
+}
+
+const char* bool_csv(bool value) {
+    return value ? "true" : "false";
+}
+
 void fail_assertion(ReplaySummary& summary, const std::string& message) {
     ++summary.assertions_failed;
     summary.valid = false;
@@ -811,6 +841,30 @@ bool ReplaySummaryBuilder::write_summary(
     return true;
 }
 
+bool ReplaySummaryBuilder::write_summary_csv(
+    const ReplaySummary& summary,
+    const std::filesystem::path& output_path,
+    std::string& error) const {
+    try {
+        if (output_path.has_parent_path()) {
+            std::filesystem::create_directories(output_path.parent_path());
+        }
+    } catch (const std::exception& ex) {
+        error = std::string("failed to create summary CSV directory: ") + ex.what();
+        return false;
+    }
+
+    std::ofstream output(output_path);
+    if (!output.is_open()) {
+        error = "failed to open summary CSV output: " + output_path.string();
+        return false;
+    }
+
+    output << replay_summary_csv_header() << '\n'
+           << replay_summary_csv_row(summary) << '\n';
+    return true;
+}
+
 std::string replay_summary_json(const ReplaySummary& summary) {
     const uint64_t duration_wall_ms =
         summary.last_ts_wall >= summary.first_ts_wall ? summary.last_ts_wall - summary.first_ts_wall : 0;
@@ -890,6 +944,74 @@ std::string replay_summary_json(const ReplaySummary& summary) {
         << "  },\n"
         << "  \"warnings\": " << warnings_json(summary.warnings) << "\n"
         << "}";
+    return oss.str();
+}
+
+std::string replay_summary_csv_header() {
+    return "run_id,scenario,config_hash,valid,samples,processes,scores,predictions,decisions,actions,events,"
+           "parse_errors,duration_wall_ms,duration_mono_ms,peak_ups,peak_risk_score,peak_mem_full_avg10,"
+           "peak_gpu_util_pct,peak_vram_used_mb,min_vram_free_mb,pressure_normal,pressure_elevated,"
+           "pressure_critical,risk_low,risk_medium,risk_high,risk_critical,state_normal,state_elevated,"
+           "state_throttled,state_recovery,state_cooldown,action_observe,action_reprioritize,action_throttle,"
+           "action_resume,action_terminate_candidate,run_metadata_present,config_snapshot_present,"
+           "telemetry_quality_present,scenario_manifest_present,assertions_checked,assertions_passed,"
+           "assertions_failed,warning_count,assertion_failure_count";
+}
+
+std::string replay_summary_csv_row(const ReplaySummary& summary) {
+    const uint64_t duration_wall_ms =
+        summary.last_ts_wall >= summary.first_ts_wall ? summary.last_ts_wall - summary.first_ts_wall : 0;
+    const uint64_t duration_mono_ms =
+        summary.last_ts_mono >= summary.first_ts_mono ? summary.last_ts_mono - summary.first_ts_mono : 0;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3)
+        << csv_escape(summary.run_id) << ","
+        << csv_escape(summary.scenario) << ","
+        << csv_escape(summary.config_hash) << ","
+        << bool_csv(summary.valid) << ","
+        << summary.counts.samples << ","
+        << summary.counts.processes << ","
+        << summary.counts.scores << ","
+        << summary.counts.predictions << ","
+        << summary.counts.decisions << ","
+        << summary.counts.actions << ","
+        << summary.counts.events << ","
+        << summary.counts.parse_errors << ","
+        << duration_wall_ms << ","
+        << duration_mono_ms << ","
+        << summary.peak_ups << ","
+        << summary.peak_risk_score << ","
+        << summary.peak_mem_full_avg10 << ","
+        << summary.peak_gpu_util_pct << ","
+        << summary.peak_vram_used_mb << ","
+        << (summary.saw_vram_free ? summary.min_vram_free_mb : 0.0) << ","
+        << count_for(summary.pressure_bands, "normal") << ","
+        << count_for(summary.pressure_bands, "elevated") << ","
+        << count_for(summary.pressure_bands, "critical") << ","
+        << count_for(summary.risk_bands, "low") << ","
+        << count_for(summary.risk_bands, "medium") << ","
+        << count_for(summary.risk_bands, "high") << ","
+        << count_for(summary.risk_bands, "critical") << ","
+        << count_for(summary.scheduler_states, "normal") << ","
+        << count_for(summary.scheduler_states, "elevated") << ","
+        << count_for(summary.scheduler_states, "throttled") << ","
+        << count_for(summary.scheduler_states, "recovery") << ","
+        << count_for(summary.scheduler_states, "cooldown") << ","
+        << count_for(summary.decision_actions, "observe") << ","
+        << count_for(summary.decision_actions, "reprioritize") << ","
+        << count_for(summary.decision_actions, "throttle") << ","
+        << count_for(summary.decision_actions, "resume") << ","
+        << count_for(summary.decision_actions, "terminate_candidate") << ","
+        << bool_csv(summary.run_metadata_present) << ","
+        << bool_csv(summary.config_snapshot_present) << ","
+        << bool_csv(summary.telemetry_quality_present) << ","
+        << bool_csv(summary.scenario_manifest_present) << ","
+        << summary.assertions_checked << ","
+        << summary.assertions_passed << ","
+        << summary.assertions_failed << ","
+        << summary.warnings.size() << ","
+        << summary.assertion_failures.size();
     return oss.str();
 }
 

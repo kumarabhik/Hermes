@@ -27,6 +27,25 @@ InterventionResult DryRunExecutor::execute(const InterventionDecision& decision)
     }
 
     result.system_effect = effect.str();
+
+    switch (decision.action) {
+    case ActionKind::Reprioritize:
+        result.reversal_condition = "UPS returns to normal band and risk drops to low for 3 consecutive cycles";
+        break;
+    case ActionKind::Throttle:
+        result.reversal_condition = "UPS below elevated band and risk below high for 10s hysteresis window";
+        break;
+    case ActionKind::TerminateCandidate:
+        result.reversal_condition = "none: process termination is irreversible";
+        break;
+    case ActionKind::Resume:
+        result.reversal_condition = "none: resume restores normal scheduling";
+        break;
+    default:
+        result.reversal_condition = "none";
+        break;
+    }
+
     return result;
 }
 

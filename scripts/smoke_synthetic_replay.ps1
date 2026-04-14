@@ -60,21 +60,43 @@ try {
     }
 
     $summaryPath = Join-Path $runDirectory "replay_summary.json"
+    $runCsvPath = Join-Path $runDirectory "summary.csv"
     $artifactSummaryPath = Join-Path (Join-Path $ArtifactRoot "summaries") ($RunId + "-summary.json")
+    $artifactCsvPath = Join-Path (Join-Path $ArtifactRoot "summaries") ($RunId + "-summary.csv")
     if (!(Test-Path $summaryPath)) {
         throw "Replay summary was not written: $summaryPath"
+    }
+    if (!(Test-Path $runCsvPath)) {
+        throw "Run summary CSV was not written: $runCsvPath"
     }
     if (!(Test-Path $artifactSummaryPath)) {
         throw "Artifact summary copy was not written: $artifactSummaryPath"
     }
+    if (!(Test-Path $artifactCsvPath)) {
+        throw "Artifact summary CSV copy was not written: $artifactCsvPath"
+    }
 
     $summary = Get-Content -Path $summaryPath -Raw | ConvertFrom-Json
     $artifactSummary = Get-Content -Path $artifactSummaryPath -Raw | ConvertFrom-Json
+    $runCsvRow = Import-Csv -Path $runCsvPath | Select-Object -First 1
+    $artifactCsvRow = Import-Csv -Path $artifactCsvPath | Select-Object -First 1
     if ($summary.valid -ne $true) {
         throw "Replay summary is invalid"
     }
     if ($artifactSummary.run_id -ne $summary.run_id) {
         throw "Artifact summary copy has a mismatched run_id"
+    }
+    if ($runCsvRow.run_id -ne $summary.run_id) {
+        throw "Run summary CSV has a mismatched run_id"
+    }
+    if ($artifactCsvRow.run_id -ne $summary.run_id) {
+        throw "Artifact summary CSV copy has a mismatched run_id"
+    }
+    if ([string]$artifactCsvRow.valid -ne "true") {
+        throw "Artifact summary CSV copy did not record a valid run"
+    }
+    if ([int]$artifactCsvRow.assertions_failed -ne 0) {
+        throw "Artifact summary CSV copy recorded assertion failures"
     }
     if ([int]$summary.manifest_assertions.checked -lt 1) {
         throw "No manifest assertions were checked"
@@ -89,6 +111,7 @@ try {
     Write-Host "Synthetic replay smoke passed"
     Write-Host "Run directory: $runDirectory"
     Write-Host "Summary copy: $artifactSummaryPath"
+    Write-Host "Summary CSV copy: $artifactCsvPath"
     Write-Host "Assertions: $($summary.manifest_assertions.passed)/$($summary.manifest_assertions.checked)"
     Write-Host "Peak UPS: $($summary.peaks.ups)"
     Write-Host "Peak risk: $($summary.peaks.risk_score)"

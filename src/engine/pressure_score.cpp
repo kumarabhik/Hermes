@@ -15,7 +15,7 @@ double clamp01(double value) {
 PressureScoreCalculator::PressureScoreCalculator(PressureScoreConfig config)
     : config_(config) {}
 
-PressureScore PressureScoreCalculator::compute(const PressureSample& sample) const {
+PressureScore PressureScoreCalculator::compute(const PressureSample& sample) {
     PressureScore score;
     score.ts_mono = sample.ts_mono;
 
@@ -26,17 +26,23 @@ PressureScore PressureScoreCalculator::compute(const PressureSample& sample) con
     score.components.n_gpu_util = clamp01(sample.gpu_util_pct / 100.0);
     score.components.n_vram =
         sample.vram_total_mb > 0.0 ? clamp01(sample.vram_used_mb / sample.vram_total_mb) : 0.0;
+    // IO PSI: weighted more toward full stalls (like mem). Only active when io_weight > 0.
+    score.components.n_io = std::max(
+        clamp01(sample.io_full_avg10 / 5.0),
+        0.5 * clamp01(sample.io_some_avg10 / 20.0));
 
     score.components.weighted_cpu = config_.cpu_weight * score.components.n_cpu;
     score.components.weighted_mem = config_.mem_weight * score.components.n_mem;
     score.components.weighted_gpu_util = config_.gpu_weight * score.components.n_gpu_util;
     score.components.weighted_vram = config_.vram_weight * score.components.n_vram;
+    score.components.weighted_io = config_.io_weight * score.components.n_io;
 
     score.ups = 100.0 * (
         score.components.weighted_cpu +
         score.components.weighted_mem +
         score.components.weighted_gpu_util +
-        score.components.weighted_vram);
+        score.components.weighted_vram +
+        score.components.weighted_io);
 
     if (score.ups >= config_.critical_threshold) {
         score.band = PressureBand::Critical;
@@ -51,6 +57,7 @@ PressureScore PressureScoreCalculator::compute(const PressureSample& sample) con
         {"vram", score.components.weighted_vram},
         {"cpu", score.components.weighted_cpu},
         {"gpu", score.components.weighted_gpu_util},
+        {"io",  score.components.weighted_io},
     };
     std::sort(weighted_signals.begin(), weighted_signals.end(), [](const auto& left, const auto& right) {
         return left.second > right.second;
@@ -61,6 +68,11 @@ PressureScore PressureScoreCalculator::compute(const PressureSample& sample) con
             score.dominant_signals.push_back(signal.first);
         }
     }
+
+    score.previous_band = last_band_;
+    score.band_changed = !first_sample_ && (score.band != last_band_);
+    last_band_ = score.band;
+    first_sample_ = false;
 
     return score;
 }

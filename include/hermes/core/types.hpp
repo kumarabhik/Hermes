@@ -164,11 +164,15 @@ struct PressureSample {
     double cpu_full_avg10{0.0};
     double mem_some_avg10{0.0};
     double mem_full_avg10{0.0};
+    double io_some_avg10{0.0};   // /proc/pressure/io — Tier B/C only
+    double io_full_avg10{0.0};   // /proc/pressure/io — Tier B/C only
     double gpu_util_pct{0.0};
     double vram_used_mb{0.0};
     double vram_total_mb{0.0};
     double vram_free_mb{0.0};
     uint32_t loadavg_runnable{0};
+    uint64_t vmstat_pgmajfault{0}; // /proc/vmstat pgmajfault — major page faults since boot
+    uint64_t vmstat_pgfault{0};    // /proc/vmstat pgfault — minor page faults since boot
 };
 
 inline void stamp_pressure_sample(PressureSample& sample) {
@@ -203,16 +207,20 @@ struct PressureComponents {
     double n_mem{0.0};
     double n_gpu_util{0.0};
     double n_vram{0.0};
+    double n_io{0.0};            // IO PSI component (0 when unavailable)
     double weighted_cpu{0.0};
     double weighted_mem{0.0};
     double weighted_gpu_util{0.0};
     double weighted_vram{0.0};
+    double weighted_io{0.0};     // IO PSI weighted contribution
 };
 
 struct PressureScore {
     uint64_t ts_mono{0};
     double ups{0.0};
     PressureBand band{PressureBand::Normal};
+    PressureBand previous_band{PressureBand::Normal};
+    bool band_changed{false};
     PressureComponents components{};
     std::vector<std::string> dominant_signals;
 };
@@ -248,6 +256,29 @@ struct InterventionResult {
     std::string error;
     std::string system_effect;
     bool reverted{false};
+    std::string reversal_condition;
+};
+
+// KernelTraceSample: optional kernel-observability record from eBPF or /proc/vmstat.
+// Emitted when kernel tracing is enabled. Aligned with PSI, VRAM, and UPS events.
+struct KernelTraceSample {
+    uint64_t ts_mono{0};
+    uint64_t ts_wall{0};
+    double runqlat_us{0.0};        // scheduler run-queue latency (p50 from eBPF, or 0)
+    uint64_t minor_faults{0};      // per-interval minor page faults (delta from vmstat)
+    uint64_t major_faults{0};      // per-interval major page faults (delta from vmstat)
+    uint64_t ctx_switches{0};      // per-interval context switches (delta from /proc/stat)
+    double futex_wait_us{0.0};     // futex wait latency from eBPF (or 0 if unavailable)
+    std::string source;            // "ebpf", "vmstat", "simulated"
+};
+
+// ReplayFrame: offline simulation unit for policy re-execution.
+struct ReplayFrame {
+    uint64_t frame_id{0};
+    std::string scenario;
+    uint64_t sample_ts_mono{0};   // reference into samples.ndjson
+    uint64_t decision_ts_mono{0}; // reference into decisions.ndjson
+    std::string expected_outcome; // "none", "reprioritize", "throttle", "terminate"
 };
 
 } // namespace hermes

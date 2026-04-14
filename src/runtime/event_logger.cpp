@@ -162,7 +162,9 @@ void EventLogger::log_sample(
     bool cpu_available,
     bool mem_available,
     bool loadavg_available,
-    bool gpu_available) {
+    bool gpu_available,
+    bool io_available,
+    bool vmstat_available) {
     std::ostringstream oss;
     oss << "{" << common_fields(sample.ts_wall, sample.ts_mono)
         << ",\"cpu_some_avg10\":" << sample.cpu_some_avg10
@@ -173,11 +175,17 @@ void EventLogger::log_sample(
         << ",\"vram_used_mb\":" << sample.vram_used_mb
         << ",\"vram_total_mb\":" << sample.vram_total_mb
         << ",\"vram_free_mb\":" << sample.vram_free_mb
+        << ",\"io_some_avg10\":" << sample.io_some_avg10
+        << ",\"io_full_avg10\":" << sample.io_full_avg10
+        << ",\"vmstat_pgmajfault\":" << sample.vmstat_pgmajfault
+        << ",\"vmstat_pgfault\":" << sample.vmstat_pgfault
         << ",\"loadavg_runnable\":" << sample.loadavg_runnable
         << ",\"cpu_available\":" << bool_literal(cpu_available)
         << ",\"mem_available\":" << bool_literal(mem_available)
         << ",\"loadavg_available\":" << bool_literal(loadavg_available)
         << ",\"gpu_available\":" << bool_literal(gpu_available)
+        << ",\"io_available\":" << bool_literal(io_available)
+        << ",\"vmstat_available\":" << bool_literal(vmstat_available)
         << "}";
     write_line(samples_, oss.str());
 }
@@ -208,17 +216,30 @@ void EventLogger::log_score(const PressureScore& score) {
     oss << "{" << common_fields(wall_now_ms(), score.ts_mono)
         << ",\"ups\":" << score.ups
         << ",\"band\":\"" << to_string(score.band) << "\""
+        << ",\"previous_band\":\"" << to_string(score.previous_band) << "\""
+        << ",\"band_changed\":" << bool_literal(score.band_changed)
         << ",\"n_cpu\":" << score.components.n_cpu
         << ",\"n_mem\":" << score.components.n_mem
         << ",\"n_gpu_util\":" << score.components.n_gpu_util
         << ",\"n_vram\":" << score.components.n_vram
+        << ",\"n_io\":" << score.components.n_io
         << ",\"weighted_cpu\":" << score.components.weighted_cpu
         << ",\"weighted_mem\":" << score.components.weighted_mem
         << ",\"weighted_gpu_util\":" << score.components.weighted_gpu_util
         << ",\"weighted_vram\":" << score.components.weighted_vram
+        << ",\"weighted_io\":" << score.components.weighted_io
         << ",\"dominant_signals\":" << json_string_array(score.dominant_signals)
         << "}";
     write_line(scores_, oss.str());
+
+    if (score.band_changed) {
+        std::ostringstream payload;
+        payload << "{\"previous_band\":\"" << to_string(score.previous_band) << "\","
+                << "\"band\":\"" << to_string(score.band) << "\","
+                << "\"ups\":" << score.ups << ","
+                << "\"dominant_signals\":" << json_string_array(score.dominant_signals) << "}";
+        log_event("band_transition", payload.str());
+    }
 }
 
 void EventLogger::log_prediction(const RiskPrediction& prediction) {
@@ -280,6 +301,7 @@ void EventLogger::log_action(const InterventionDecision& decision, const Interve
         << ",\"error\":\"" << json_escape(result.error) << "\""
         << ",\"system_effect\":\"" << json_escape(result.system_effect) << "\""
         << ",\"reverted\":" << bool_literal(result.reverted)
+        << ",\"reversal_condition\":\"" << json_escape(result.reversal_condition) << "\""
         << ",\"mode\":\"" << to_string(decision.mode) << "\""
         << "}";
     write_line(actions_, oss.str());

@@ -60,7 +60,7 @@ HERMES_RUN_ID=dev-smoke HERMES_SCENARIO=observe HERMES_MAX_LOOPS=1 ./hermesd
 ./hermes_replay artifacts/logs/dev-smoke
 ```
 
-It writes `replay_summary.json` beside the run and also copies the same summary to `artifacts/replay/<run_id>-summary.json` and `artifacts/summaries/<run_id>-summary.json`. The current replay tool validates record identity fields and summarizes counts, time window, pressure/risk peaks, scheduler states, actions, event kinds, and whether metadata, config snapshot, and telemetry quality artifacts are present. Full deterministic scheduler re-execution is still a later milestone.
+It writes `replay_summary.json` and `summary.csv` beside the run, then copies the JSON and CSV summaries to `artifacts/replay/<run_id>-summary.*` and `artifacts/summaries/<run_id>-summary.*`. The current replay tool validates record identity fields and summarizes counts, time window, pressure/risk peaks, scheduler states, actions, event kinds, manifest assertions, and whether metadata, config snapshot, and telemetry quality artifacts are present. Full deterministic scheduler re-execution is still a later milestone.
 
 If a run contains `scenario_manifest.json`, `hermes_replay` treats its expectations as assertions. It can check named signals, minimum peak UPS, minimum peak risk, minimum action counts, minimum scheduler state counts, and minimum pressure or risk band counts. Missing expectations mark the summary invalid and make the CLI exit nonzero.
 
@@ -83,4 +83,12 @@ On Windows or a lightweight shell with `g++`, run the synthetic replay smoke che
 .\scripts\smoke_synthetic_replay.ps1
 ```
 
-The script builds `hermes_synth` and `hermes_replay`, generates a synthetic run, replays it, checks the summary copy in `artifacts/summaries/`, and fails if the manifest assertions do not pass.
+The script builds `hermes_synth` and `hermes_replay`, generates a synthetic run, replays it, checks the JSON and CSV summary copies in `artifacts/summaries/`, and fails if the manifest assertions do not pass.
+
+To smoke-check the real daemon artifact path without leaving the daemon running forever:
+
+```powershell
+.\scripts\smoke_daemon_replay.ps1
+```
+
+That script builds `hermesd` and `hermes_replay`, runs the daemon with `HERMES_MAX_LOOPS=1` in observe-only mode, verifies the daemon NDJSON and metadata artifacts, replays the run, and checks the JSON and CSV summaries.

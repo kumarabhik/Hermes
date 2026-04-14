@@ -40,7 +40,9 @@ public:
         bool cpu_available,
         bool mem_available,
         bool loadavg_available,
-        bool gpu_available);
+        bool gpu_available,
+        bool io_available = false,
+        bool vmstat_available = false);
     void log_processes(const PressureSample& sample, const std::vector<ProcessSnapshot>& processes);
     void log_score(const PressureScore& score);
     void log_prediction(const RiskPrediction& prediction);

@@ -100,3 +100,11 @@ To smoke-check benchmark scenario planning without launching real workloads:
 ```
 
 That script builds `hermes_bench`, generates a default baseline scenario, runs a dry-run benchmark plan, and verifies the plan JSON plus scenario snapshot under `artifacts/bench/`.
+
+To smoke-check bounded benchmark workload launch and summary writing:
+
+```powershell
+.\scripts\smoke_benchmark_launch.ps1
+```
+
+That script builds `hermes_bench`, runs a short four-workload benchmark scenario with local commands, verifies the plan and scenario snapshot, and checks the benchmark run summary under `artifacts/bench/`.

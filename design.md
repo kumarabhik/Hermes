@@ -1512,3 +1512,38 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
   - `artifacts/bench/codex-bench-plan-20260414-plan.json`
   - `artifacts/bench/codex-bench-plan-20260414-scenario.yaml`
+
+#### 2026-04-14 IST - Benchmark Launch Summary Pass
+- Verified repo facts:
+  - `src/cli/hermes_bench.cpp` now launches bounded workloads, supervises them for the benchmark window, terminates overruns, and writes `artifacts/bench/<run_id>-summary.json`.
+  - The benchmark summary artifact records run identity, runtime mode, duration, workload counts, launched count, launch failures, completed jobs, timed-out jobs, nonzero exits, notes, and per-workload exit details.
+  - Added `scripts/smoke_benchmark_launch.ps1`.
+  - The benchmark launch smoke script builds `hermes_bench`, writes a four-workload local scenario, runs the benchmark harness, and verifies the plan, scenario snapshot, and summary artifacts.
+  - `README.md` now documents the benchmark launch smoke script.
+  - `roadmap.md` now reflects bounded benchmark workload launch and partial baseline-mode progress while keeping full benchmark evidence open.
+  - Running `.\scripts\smoke_benchmark_launch.ps1 -RunId codex-bench-launch-20260414` succeeded.
+  - The verified launch smoke run recorded `launched=4`, `launch_failed=0`, `jobs_completed=3`, `timed_out=1`, and `duration_ms=2100`.
+- Decisions made:
+  - Kept workload launch bounded by both the benchmark window and each workload's declared `duration_s`.
+  - Wrote benchmark run summaries under `artifacts/bench/` instead of overloading replay summary artifacts meant for daemon and fixture runs.
+  - Used harmless local PowerShell commands in the smoke script so workload launch behavior can be verified without external benchmark dependencies.
+- Assumptions still in force:
+  - These benchmark run summaries are harness-level artifacts, not proof of better OOM behavior or lower latency.
+  - Real benchmark claims still require native Linux GPU runs with Hermes in the loop.
+  - `RESULTS.md` remains local-only and ignored by git.
+- Open risks:
+  - `hermes_bench` still does not launch `hermesd` or coordinate Hermes runtime modes around workloads.
+  - The current harness does not yet collect OOM counts, p95 latency, or profiling captures.
+  - The smoke launch scenario is Windows-oriented because the current authoring shell is PowerShell.
+- Next recommended actions:
+  - Add Hermes daemon orchestration around benchmark workload runs.
+  - Add benchmark run-summary fields for OOM count, jobs completed vs expected, and degraded-behavior notes.
+  - Add Linux-native smoke coverage for workload launch and Hermes orchestration once CMake/native Linux is available.
+- Evidence paths / artifacts:
+  - `src/cli/hermes_bench.cpp`
+  - `scripts/smoke_benchmark_launch.ps1`
+  - `README.md`
+  - `roadmap.md`
+  - `artifacts/bench/codex-bench-launch-20260414-plan.json`
+  - `artifacts/bench/codex-bench-launch-20260414-scenario.yaml`
+  - `artifacts/bench/codex-bench-launch-20260414-summary.json`

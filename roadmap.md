@@ -33,11 +33,11 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - `hermes_report` reads all run replay summaries and prints a comparison table and CSV.
 - `LatencyProbe` tracks per-loop policy thread latency (p50/p95/p99/max) and writes `latency_summary.json`.
 - An offline predictor evaluator (`hermes_eval`) computes precision, recall, F1, and mean lead time from run artifacts.
-- A benchmark scenario config loader (`ScenarioConfigLoader`) and harness stub (`hermes_bench`) exist; harness workload launch is pending.
+- A benchmark scenario config loader (`ScenarioConfigLoader`) and harness stub (`hermes_bench`) exist; the harness can write dry-run plan artifacts and scenario snapshots, while workload launch is pending.
 - A runtime event logger writes per-run NDJSON artifacts for samples, processes, scores, predictions, decisions, actions, and generic events.
 - Daemon runs write `run_metadata.json`, `config_snapshot.yaml`, and `telemetry_quality.json`.
 - A replay summary CLI validates run directories and emits `replay_summary.json` plus per-run `summary.csv` rows under the run directory, `artifacts/replay/`, and `artifacts/summaries/`.
-- PowerShell smoke scripts verify both deterministic synthetic replay and one-loop observe-mode daemon artifact generation through the direct `g++` path.
+- PowerShell smoke scripts verify deterministic synthetic replay, one-loop observe-mode daemon artifact generation, and benchmark plan artifact generation through the direct `g++` path.
 - A synthetic fixture CLI generates deterministic pressure traces covering Level 1-3, cooldown, and recovery paths.
 - No benchmark run outputs with real ML jobs, `strace` captures, `perf` captures, eBPF traces, or `gdb` evidence exist yet.
 
@@ -55,7 +55,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] Artifact directory layout exists for logs, summaries, plots, replay data, and profiling captures.
 - [x] Runtime run metadata and config snapshot artifacts are written for daemon runs.
 - [x] Runtime telemetry-quality artifacts are written for daemon runs.
-- [x] Synthetic replay and one-loop daemon replay smoke scripts exist for local `g++` verification.
+- [x] Synthetic replay, one-loop daemon replay, and benchmark plan smoke scripts exist for local `g++` verification.
 
 ## Phase 1: Observability and Attribution
 
@@ -94,7 +94,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 
 ## Phase 4: Benchmark Harness and Evaluation
 
-- [~] Benchmark harness scaffold (`hermes_bench`) loads and validates scenario YAML configs; can generate default baseline and active-control scenario templates; workload launch and parallel process management are still pending.
+- [~] Benchmark harness scaffold (`hermes_bench`) loads and validates scenario YAML configs, can generate default baseline and active-control scenario templates, and writes dry-run plan artifacts plus scenario snapshots under `artifacts/bench/`; workload launch and parallel process management are still pending.
 - [ ] Baseline mode runs without Hermes and captures comparison artifacts.
 - [ ] Observe-only mode captures detection quality without host mutation.
 - [ ] Active-intervention mode captures before/after control impact with the same frozen thresholds.

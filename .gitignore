@@ -59,8 +59,12 @@ venv/
 
 # Project specific
 HERMES_EXPLANATION.md
+RESULTS.md
+results.md
 artifacts/logs/*
 !artifacts/logs/.gitkeep
+artifacts/bench/*
+!artifacts/bench/.gitkeep
 artifacts/summaries/*
 !artifacts/summaries/.gitkeep
 artifacts/plots/*

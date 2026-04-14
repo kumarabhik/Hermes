@@ -1474,3 +1474,41 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/logs/codex-daemon-smoke-20260414/summary.csv`
   - `artifacts/logs/codex-daemon-smoke-20260414/telemetry_quality.json`
   - `artifacts/summaries/codex-daemon-smoke-20260414-summary.csv`
+
+#### 2026-04-14 IST - Benchmark Plan Artifact Pass
+- Verified repo facts:
+  - Added `RESULTS.md` as a local-only results summary and added it to `.gitignore` so it is not committed to GitHub.
+  - Added `artifacts/bench/.gitkeep` and ignore rules for generated benchmark plan artifacts under `artifacts/bench/`.
+  - `src/cli/hermes_bench.cpp` now validates benchmark scenario plans, counts foreground/background workloads, computes planned workload seconds, and writes a JSON plan artifact plus normalized scenario snapshot.
+  - `hermes_bench` now accepts `--artifact-root` and `--run-id` for deterministic plan artifact paths.
+  - Added `scripts/smoke_benchmark_plan.ps1`.
+  - The benchmark plan smoke script builds `hermes_bench` with direct `g++`, generates a default baseline scenario, runs a dry-run plan, verifies `artifacts/bench/<run_id>-plan.json`, verifies `artifacts/bench/<run_id>-scenario.yaml`, and checks the plan fields.
+  - `README.md` documents the benchmark plan smoke script.
+  - `roadmap.md` records benchmark plan artifact generation while keeping workload launch and benchmark evidence open.
+  - Running `.\scripts\smoke_benchmark_plan.ps1 -RunId codex-bench-plan-20260414` succeeded.
+  - The verified plan recorded `workload_count=4`, `foreground_workloads=1`, `background_workloads=3`, and `planned_workload_seconds=2400`.
+- Decisions made:
+  - Wrote benchmark plan artifacts before workload launch so future benchmark runs have an auditable scenario plan and config snapshot.
+  - Kept generated benchmark plan outputs ignored by git, matching the rest of the artifact policy.
+  - Treated `RESULTS.md` as a local progress note because the user asked not to commit results to GitHub.
+- Assumptions still in force:
+  - Benchmark plan artifacts are planning evidence, not performance evidence.
+  - Real benchmark claims still require native Linux GPU runs with saved run outputs.
+  - Direct `g++` smoke verification remains the local path until CMake is available.
+- Open risks:
+  - `hermes_bench` still does not launch or supervise workloads.
+  - No OOM count, p95 latency, job completion, `strace`, or `perf` evidence exists yet.
+  - The scenario parser is intentionally simple and not a full YAML parser.
+- Next recommended actions:
+  - Add bounded workload launch supervision to `hermes_bench`.
+  - Add benchmark run-summary artifacts for OOM count, latency placeholders, jobs completed, and degraded-behavior notes.
+  - Add a Linux shell or CTest wrapper for smoke checks when CMake is available.
+- Evidence paths / artifacts:
+  - `.gitignore`
+  - `artifacts/bench/.gitkeep`
+  - `src/cli/hermes_bench.cpp`
+  - `scripts/smoke_benchmark_plan.ps1`
+  - `README.md`
+  - `roadmap.md`
+  - `artifacts/bench/codex-bench-plan-20260414-plan.json`
+  - `artifacts/bench/codex-bench-plan-20260414-scenario.yaml`

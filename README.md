@@ -92,3 +92,11 @@ To smoke-check the real daemon artifact path without leaving the daemon running 
 ```
 
 That script builds `hermesd` and `hermes_replay`, runs the daemon with `HERMES_MAX_LOOPS=1` in observe-only mode, verifies the daemon NDJSON and metadata artifacts, replays the run, and checks the JSON and CSV summaries.
+
+To smoke-check benchmark scenario planning without launching real workloads:
+
+```powershell
+.\scripts\smoke_benchmark_plan.ps1
+```
+
+That script builds `hermes_bench`, generates a default baseline scenario, runs a dry-run benchmark plan, and verifies the plan JSON plus scenario snapshot under `artifacts/bench/`.

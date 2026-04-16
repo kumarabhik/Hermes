@@ -14,6 +14,8 @@
 //   hermes_bench --generate-baseline [output.yaml]
 //   hermes_bench --generate-active [output.yaml]
 //   hermes_bench --generate-oom-stress [output.yaml]
+//   hermes_bench --smoke-all [--dry-run] [--artifact-root DIR] [--hermes-bin PATH]
+//                            [--replay-bin PATH] [--compare-bin PATH]
 
 #include "hermes/runtime/scenario_config.hpp"
 
@@ -1627,6 +1629,140 @@ void generate_scenario(const std::string& path, bool active) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// --smoke-all: run all pre-built scenarios in sequence, then auto-compare.
+// ---------------------------------------------------------------------------
+
+int run_smoke_all(
+    const std::string& self_path,
+    const std::vector<std::string>& args,
+    const std::string& artifact_root)
+{
+    const bool dry_run = has_flag(args, "--dry-run");
+
+    // Forward optional path overrides from the caller.
+    std::string hermes_bin, replay_bin, compare_bin;
+    option_value(args, "--hermes-bin",  hermes_bin);
+    option_value(args, "--replay-bin",  replay_bin);
+    option_value(args, "--compare-bin", compare_bin);
+
+    // Pre-built scenario configs — generate missing ones on the fly.
+    struct SmokeTarget {
+        std::string config_path;
+        std::string run_id_prefix;
+        std::string label;
+    };
+
+    const std::vector<SmokeTarget> targets = {
+        {"config/baseline_scenario.yaml",   "smoke-baseline",   "Baseline"},
+        {"config/observe_scenario.yaml",    "smoke-observe",    "Observe-only"},
+        {"config/oom_stress_scenario.yaml", "smoke-oom-stress", "OOM-stress"},
+    };
+
+    // Auto-generate any missing configs.
+    {
+        hermes::ScenarioConfigLoader loader;
+        std::string err;
+        if (!std::filesystem::exists("config/baseline_scenario.yaml"))
+            loader.save("config/baseline_scenario.yaml", loader.default_baseline(), err);
+        if (!std::filesystem::exists("config/observe_scenario.yaml"))
+            loader.save("config/observe_scenario.yaml", loader.default_active(), err);
+        if (!std::filesystem::exists("config/oom_stress_scenario.yaml")) {
+            generate_oom_stress("config/oom_stress_scenario.yaml");
+        }
+    }
+
+    struct RunResult {
+        std::string label;
+        int exit_code{-1};
+        bool timed_out{false};
+        uint64_t duration_ms{0};
+    };
+
+    std::vector<RunResult> results;
+
+    const std::string sep(70, '=');
+    std::cout << "\n" << sep << "\n";
+    std::cout << "hermes_bench --smoke-all: running " << targets.size() << " scenario(s)\n";
+    std::cout << sep << "\n\n";
+
+    for (const SmokeTarget& target : targets) {
+        std::cout << "--- Scenario: " << target.label << " (" << target.config_path << ") ---\n";
+
+        std::vector<std::string> child_args = {
+            target.config_path,
+            "--artifact-root", artifact_root,
+            "--run-id", target.run_id_prefix,
+        };
+        if (dry_run)           child_args.push_back("--dry-run");
+        if (!hermes_bin.empty()) { child_args.push_back("--hermes-bin");  child_args.push_back(hermes_bin); }
+        if (!replay_bin.empty()) { child_args.push_back("--replay-bin");  child_args.push_back(replay_bin); }
+
+        RunResult r;
+        r.label = target.label;
+        const uint64_t t0 = wall_now_ms();
+        std::string error;
+        const bool ok = run_program_sync(self_path, child_args, 300000,
+                                         r.exit_code, r.timed_out, error);
+        r.duration_ms = wall_now_ms() - t0;
+        (void)ok;
+        results.push_back(r);
+
+        std::cout << "  [" << target.label << "] exit=" << r.exit_code
+                  << " timed_out=" << (r.timed_out ? "yes" : "no")
+                  << " elapsed=" << (r.duration_ms / 1000) << "s\n\n";
+    }
+
+    // Auto-compare across all runs.
+    std::cout << "--- Auto-compare ---\n";
+    const std::string compare_bin_path =
+        compare_bin.empty()
+            ? (std::filesystem::path(self_path).parent_path() / "hermes_compare").string()
+            : compare_bin;
+    const std::string output_csv = artifact_root + "/bench/smoke_all_comparison.csv";
+
+    int cmp_exit = -1;
+    bool cmp_timed_out = false;
+    std::string cmp_err;
+    run_program_sync(compare_bin_path,
+                     {"--bench-dir", artifact_root + "/bench",
+                      "--output-csv", output_csv},
+                     30000, cmp_exit, cmp_timed_out, cmp_err);
+    if (cmp_exit == 0) {
+        std::cout << "  comparison CSV written to " << output_csv << "\n";
+    } else {
+        std::cout << "  hermes_compare not available or no summaries found (skip)\n";
+    }
+
+    // Summary table.
+    int failed = 0;
+    std::cout << "\n" << sep << "\n";
+    std::cout << "hermes_bench --smoke-all: summary\n";
+    std::cout << sep << "\n";
+    std::cout << std::left << std::setw(20) << "Scenario"
+              << std::setw(8) << "Exit"
+              << std::setw(8) << "Timeout"
+              << std::setw(10) << "Elapsed\n";
+    std::cout << std::string(46, '-') << "\n";
+    for (const RunResult& r : results) {
+        const bool pass = !r.timed_out && r.exit_code == 0;
+        if (!pass) ++failed;
+        std::cout << std::left << std::setw(20) << r.label
+                  << std::setw(8) << r.exit_code
+                  << std::setw(8) << (r.timed_out ? "YES" : "no")
+                  << std::setw(10) << (std::to_string(r.duration_ms / 1000) + "s")
+                  << (pass ? "  PASS" : "  FAIL") << "\n";
+    }
+    std::cout << sep << "\n";
+    if (failed == 0) {
+        std::cout << "Result: ALL PASS\n";
+    } else {
+        std::cout << "Result: " << failed << " scenario(s) FAILED\n";
+    }
+    std::cout << sep << "\n\n";
+    return failed > 0 ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1637,6 +1773,7 @@ int main(int argc, char* argv[]) {
                   << "       hermes_bench --generate-baseline   [output.yaml]\n"
                   << "       hermes_bench --generate-active     [output.yaml]\n"
                   << "       hermes_bench --generate-oom-stress [output.yaml]\n"
+                  << "       hermes_bench --smoke-all           [options]\n"
                   << "\nOptions:\n"
                   << "  --dry-run           Print plan without launching workloads\n"
                   << "  --artifact-root DIR Artifact root for plan output (default: $HERMES_ARTIFACT_ROOT or artifacts)\n"
@@ -1650,7 +1787,8 @@ int main(int argc, char* argv[]) {
                   << "  --delta-vs PATH     Compare this run's summary against a saved baseline summary JSON\n"
                   << "  --generate-baseline   Write a default baseline scenario config\n"
                   << "  --generate-active     Write a default active-control scenario config\n"
-                  << "  --generate-oom-stress Write a memory/VRAM pressure scenario for OOM-kill intervention testing\n";
+                  << "  --generate-oom-stress Write a memory/VRAM pressure scenario for OOM-kill intervention testing\n"
+                  << "  --smoke-all           Run baseline, observe, and oom-stress scenarios in sequence; auto-compare\n";
         return args.empty() ? 1 : 0;
     }
 
@@ -1670,6 +1808,16 @@ int main(int argc, char* argv[]) {
         const std::string path = generation_output_path(args, "--generate-oom-stress", "oom_stress_scenario.yaml");
         generate_oom_stress(path);
         return 0;
+    }
+
+    if (has_flag(args, "--smoke-all")) {
+        const std::string artifact_root = [&]() {
+            std::string ar = env_or("HERMES_ARTIFACT_ROOT", "artifacts");
+            option_value(args, "--artifact-root", ar);
+            return ar;
+        }();
+        const std::string self_path = (argc > 0) ? argv[0] : "hermes_bench";
+        return run_smoke_all(self_path, args, artifact_root);
     }
 
     const std::string config_path = first_positional_arg(args);

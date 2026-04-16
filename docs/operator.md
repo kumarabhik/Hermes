@@ -148,3 +148,84 @@ All smoke scripts are under `scripts/` and use direct `g++` compilation without 
 
 These validate artifact generation and binary plumbing without requiring a Linux GPU.
 They do not produce performance evidence.
+
+To run the full smoke suite in one command:
+
+```powershell
+.\scripts\run_all_smoke.ps1
+```
+
+To check the Windows authoring environment before running smoke tests:
+
+```powershell
+.\scripts\smoke_hermes_doctor.ps1
+```
+
+---
+
+## Phase 6 Readiness Checklist
+
+Use this checklist before running Phase 6 performance evidence collection on a Linux GPU host.
+All items must pass before the results are trustworthy enough to record in RESULTS.md.
+
+### Tier A: CPU-only baseline (any Linux host)
+
+- [ ] **OS check**: `uname -r` ≥ 4.20 (PSI requires ≥ 4.20; IO-PSI requires ≥ 5.2)
+- [ ] **Build check**: `cmake -S . -B build && cmake --build build` exits 0
+- [ ] **Smoke suite**: `bash scripts/smoke_wsl2.sh` passes all 8 steps
+- [ ] **Config check**: `bash scripts/smoke_schema.sh` exits 0
+- [ ] **Doctor check**: `bash scripts/hermes_doctor.sh` shows no FAIL for Tier A items
+- [ ] **Baseline run**: `hermes_bench config/baseline_scenario.yaml --run-id tier-a-baseline`
+      produces non-empty `artifacts/bench/tier-a-baseline-summary.json`
+- [ ] **Replay check**: `hermes_replay artifacts/logs/tier-a-baseline` exits 0
+
+### Tier B: Linux host with PSI enabled
+
+All Tier A items, plus:
+
+- [ ] **PSI files present**: `ls /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io`
+- [ ] **PSI non-zero**: after running `hermes_bench config/observe_scenario.yaml`,
+      check that `samples.ndjson` contains `cpu_some_avg10 > 0` entries
+- [ ] **hermes_eval baseline**: `hermes_eval artifacts/logs/<observe-run>` exits 0
+      and `eval_summary.json` has `data_available: true`
+- [ ] **hermes_tune.py**: `python3 scripts/hermes_tune.py --eval-dir artifacts/logs`
+      prints a PASS/FAIL calibration table
+- [ ] **Low-pressure FP check**: `hermes_bench config/low_pressure_scenario.yaml
+      --verify-targets` exits 0 (`intervention_count ≤ 1`)
+- [ ] **Doctor check**: `bash scripts/hermes_doctor.sh` shows no FAIL for Tier B items
+- [ ] **Record T1 entry**: Add a row to RESULTS.md with `data_available: true` and
+      non-zero PSI readings from `telemetry_quality.json`
+
+### Tier C: Linux host with NVIDIA GPU + NVML
+
+All Tier B items, plus:
+
+- [ ] **NVML fast path**: `hermesctl nvml` reports device name, VRAM, and util
+      **without** invoking `nvidia-smi` subprocess
+- [ ] **Doctor check**: `bash scripts/hermes_doctor.sh` shows no FAIL for Tier C items
+- [ ] **GPU fidelity workload**: `hermes_bench config/oom_stress_scenario.yaml --dry-run`
+      validates the Tier C foreground command is correctly loaded
+- [ ] **Active-control smoke**: `bash scripts/smoke_wsl2.sh` Step 8 (state coverage)
+      passes on a run with `HERMES_RUNTIME_MODE=active-control`
+- [ ] **OOM-stress evidence**: `hermes_bench config/oom_stress_scenario.yaml --runs 3
+      --verify-targets --auto-compare` exits 0
+
+### Phase 6 Collection Command
+
+Run everything in one pass on a Linux host:
+
+```bash
+bash scripts/smoke_phase6.sh
+```
+
+Then generate a combined evidence report:
+
+```bash
+bash scripts/gen_evidence_report.sh
+```
+
+Finally, update RESULTS.md and populate README Key Results tables:
+
+```bash
+python3 scripts/populate_readme_results.py
+```

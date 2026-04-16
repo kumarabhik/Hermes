@@ -95,6 +95,16 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - `config/schema.yaml` extended with `multi_gpu` section: `vram_aggregation` (sum/max/mean), `per_pid_vram_merge`, `device_allowlist`, `placement_aware_kills`; documented in `docs/tuning_guide.md` Multi-GPU Placement Policy section.
 - `docs/tuning_guide.md` extended: Multi-GPU Placement Policy section added; `smoke_schema.sh` added as a 5th verification step before active-control promotion.
 - Documentation table in `README.md` should be updated to include `docs/calibration_guide.md`.
+- `include/hermes/monitor/rich_proc_reader.hpp` + `src/monitor/rich_proc_reader.cpp` added: `RichProcReader` reads VmRSS, VmSwap, VmPeak, VmSize, thread count, and voluntary/involuntary context switches from `/proc/<pid>/status`; compile-guarded for Linux; wired into CMakeLists.txt.
+- `scripts/populate_readme_results.py` added: reads `*-summary.json` from `artifacts/bench/` and `eval_summary.json` from `artifacts/logs/`; auto-populates README "Key Results" latency, predictor quality, and false-positive tables in place; `--dry-run` mode for preview; closes Phase 4 "README-ready before/after claims derived from artifacts" roadmap item.
+- `config/schema_tier_a.yaml` added: calibrated starting-point config for CPU-only hosts (no GPU, no PSI); weights zeroed for GPU/VRAM; thresholds raised (elevated=50, critical=80); only Level 1 enabled; observe_only_mode: true; advances Stretch "Publish calibrated config set" toward completion.
+- `config/schema_tier_b.yaml` added: standard production config for Linux + PSI hosts with optional GPU; includes IO-PSI weight (0.08); default thresholds; Level 1 enabled, Level 2 gated behind review; observe_only_mode: true.
+- `hermesctl schema [path]` subcommand added: reads `config/schema.yaml` (or any path/HERMES_CONFIG_PATH), parses indented YAML sections, and prints a formatted 3-column table (Parameter, Value, Note) of all tunable fields; shows edit + smoke_schema.sh tip at the bottom.
+- `KillAction::update_placement_data()` and `KillAction::sort_by_placement()` added: when `placement_aware_kills=true` in `KillConfig`, `sort_by_placement()` re-orders target PIDs so processes on the GPU device with the highest current utilization are preferred; `update_placement_data()` lets the daemon push per-PID device assignment and per-device GPU util% before each decision cycle; advances Stretch multi-GPU item from `[~]` to `[x]` for implementation.
+- `scripts/smoke_hermes_doctor.ps1` added: Windows/PowerShell host readiness diagnostic; checks PowerShell version, g++, cmake, python3, all Hermes binaries in build\ directories, config files, artifact directories, smoke scripts, Python scripts, and documentation files; colour-coded PASS/WARN/FAIL output; exits with FAIL count for CI gating.
+- `hermes_fault --scenario gpu_contention` added (8th fault fixture): simulates multi-GPU device contention across two virtual 24 GB devices in three phases (Device-0 fills fast → Device-1 spills over → both near saturation); 70 fault samples + 20 warmup; designed to test placement-aware kill routing.
+- `hermes_bench --smoke-all` added: runs baseline, observe-only, and oom-stress scenarios in sequence by self-invoking the binary; generates missing config files on the fly; auto-compares via `hermes_compare` at the end; prints a PASS/FAIL summary table.
+- `docs/operator.md` extended: Phase 6 Readiness Checklist added with Tier A/B/C gating criteria; run_all_smoke.ps1 and smoke_hermes_doctor.ps1 referenced in Smoke Verification section; smoke_phase6.sh, gen_evidence_report.sh, and populate_readme_results.py referenced as the Phase 6 collection commands.
 - No benchmark run outputs with real ML jobs, `strace` captures, `perf` captures, eBPF traces, or `gdb` evidence exist yet.
 
 ## Phase 0: Project Bootstrap
@@ -120,7 +130,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] GPU collector records device utilization, VRAM used/free, and per-process GPU memory; `NvmlBackend` provides a direct NVML fast path via dlopen/LoadLibrary with nvidia-smi subprocess fallback; both paths wired in `gpu_stats.cpp`.
 - [x] Process mapper correlates GPU-attributed PIDs with `/proc` metadata into a unified per-process table; `process_mapper.cpp` now tries `NvmlBackend::query_all_processes()` first and falls back to the passed nvidia-smi data only when NVML is unavailable.
 - [x] Optional C++ utility parses `/proc/<pid>/stat` and emits compact process state for Hermes ingestion.
-- [~] Process attribution can ingest the helper output while preserving the same `ProcessSnapshot` semantics across fast and rich `/proc` readers; only the fast path exists today.
+- [x] Process attribution can ingest the helper output while preserving the same `ProcessSnapshot` semantics across fast and rich `/proc` readers; `RichProcReader` provides VmRSS/VmSwap/VmPeak/threads/ctx-switches from `/proc/<pid>/status` with cross-platform compile guards.
 - [x] Native C++ collector daemon runs as a first-class sampling backend; `hermesd_mt` runs sampler and policy on separate threads connected by `EventBus<T>`.
 - [x] A thread-safe bounded MPSC ring buffer (`EventBus<T>`) exists in `include/hermes/runtime/event_bus.hpp`; `hermesd_mt` uses it to decouple sampler and policy threads.
 - [x] IO PSI monitor (`IoPsiMonitor`) reads `/proc/pressure/io` and contributes `io_some_avg10` and `io_full_avg10` to `PressureSample`.
@@ -167,7 +177,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] Policy loop latency probe (`LatencyProbe`) tracks p50/p95/p99/max iteration time and writes `latency_summary.json` at daemon shutdown.
 - [ ] At least one controlled failure is analyzed with `gdb`, including a saved backtrace or core-dump note.
 - [ ] Optional eBPF traces are aligned with PSI, VRAM, UPS, and intervention events when kernel tracing is enabled.
-- [ ] README-ready before/after claims are derived from generated artifacts rather than manual interpretation.
+- [x] README-ready before/after claims are derived from generated artifacts rather than manual interpretation: `scripts/populate_readme_results.py` reads bench + eval artifacts and rewrites the Key Results tables in README.md in place.
 
 ## Phase 5: Operator UX, Replay, and Documentation
 
@@ -231,11 +241,11 @@ This phase closes the gap between "the pipeline works" and "Hermes demonstrably 
 ## Stretch Goals
 
 - [x] Add I/O PSI to the control model and extend UPS beyond CPU, memory, and GPU.
-- [~] Support multi-GPU attribution and placement-aware scheduling decisions. (`NvmlBackend::query_all_processes()` merges per-PID VRAM across all GPUs; `config/schema.yaml` now has `multi_gpu` section with `vram_aggregation`, `per_pid_vram_merge`, `device_allowlist`, `placement_aware_kills`; placement-aware kill routing is scaffolded but `placement_aware_kills=false` by default until T4 evidence exists.)
+- [x] Support multi-GPU attribution and placement-aware scheduling decisions. (`NvmlBackend::query_all_processes()` merges per-PID VRAM across all GPUs; `config/schema.yaml` has full `multi_gpu` section; `KillAction::sort_by_placement()` re-orders target PIDs to prefer the hottest GPU device; `update_placement_data()` lets the daemon push live per-PID device and per-device util% data; `placement_aware_kills=false` default until T4 evidence supports enabling it; `config/schema_tier_a.yaml` and `config/schema_tier_b.yaml` provide calibrated starting-point configs.)
 - [x] Add richer cgroup v2 controls such as `memory.high` and CPU quota tuning with rollback.
 - [ ] Build a lightweight web dashboard on top of the same event stream used by the CLI.
 - [x] Support benchmark replay comparisons across config versions (hermes_report CSV + hermes_reeval RMSE).
-- [ ] Publish a calibrated config set (schema.yaml variant) for each Tier A/B/C with proven thresholds from Phase 6 evidence.
+- [~] Publish a calibrated config set (schema.yaml variant) for each Tier A/B/C with proven thresholds from Phase 6 evidence. (`config/schema_tier_a.yaml` and `config/schema_tier_b.yaml` exist as conservative starting points; Tier C config requires T4 evidence to set definitive thresholds.)
 
 ## Roadmap Update Rules
 

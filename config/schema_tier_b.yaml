@@ -1,0 +1,83 @@
+# Hermes Configuration — Tier B (Linux + PSI, standard)
+#
+# Use this config on Linux hosts where /proc/pressure/* files exist (PSI enabled)
+# and an NVIDIA GPU may be present.  This is the standard production starting
+# point once you have completed a calibration cycle with hermes_eval.
+#
+# Weights include IO PSI (a proxy for disk-bound workloads) and GPU signals.
+# Thresholds match the defaults from schema.yaml; adjust them per the calibration
+# guide after reviewing hermes_tune.py output.
+#
+# When to promote to Tier C:
+#   - NVML direct path confirmed: hermesctl nvml shows device info
+#   - Multiple GPUs are present and you want per-device placement decisions
+#   - T2 evidence exists (predictor fires under real pressure)
+#
+# Reference: docs/calibration_guide.md, docs/tuning_guide.md
+
+version: 1
+
+# --- UPS weight profile for Linux + PSI hosts with optional GPU ---
+# Sum: 0.18 + 0.15 + 0.15 + 0.14 + 0.08 + 0.30 = 1.00
+ups_weights:
+  cpu_some:  0.18    # CPU some-stall (PSI)
+  mem_some:  0.15    # Memory some-stall (PSI)
+  mem_full:  0.15    # Memory full-stall (PSI) — high-signal indicator
+  gpu_util:  0.14    # GPU utilisation (0 if no GPU)
+  vram_used: 0.30    # VRAM fill ratio — dominant predictor of OOM risk
+  io_full:   0.08    # IO full-stall — added at Tier B
+
+# --- Standard thresholds (matches schema.yaml defaults) ---
+# Run hermes_tune.py after collecting a baseline to refine these values.
+thresholds:
+  ups:
+    elevated: 40
+    critical: 70
+  mem_psi:
+    elevated_full_avg10: 2.0
+    critical_full_avg10: 5.0
+  vram:
+    high_pct:     90
+    critical_pct: 95
+  predictor:
+    high_risk: 0.70
+
+# --- Standard cooldowns ---
+cooldowns:
+  level_1_pid_sec:        15
+  level_2_pid_sec:        20
+  level_3_global_sec:    300
+  recovery_hysteresis_sec: 10
+
+# --- Actions: Level 1 enabled; Level 2 gated behind observe-only review ---
+# Workflow:
+#   1. Set observe_only_mode: true and collect a baseline run.
+#   2. Review decisions.ndjson — confirm Level 1 candidates are background pids.
+#   3. Set observe_only_mode: false to allow Level 1 actions.
+#   4. Collect 3-5 runs, check hermes_eval output, then consider enable_level_2.
+actions:
+  enable_level_1: true
+  enable_level_2: false    # Enable only after Level 1 alone proves insufficient
+  enable_level_3: false    # Reserved for headless batch environments
+  observe_only_mode: true  # Always start here; flip after baseline review
+
+# --- Multi-GPU attribution (enabled at Tier B for hosts with a GPU) ---
+# vram_aggregation: sum  — conservative; reacts to total VRAM headroom
+# per_pid_vram_merge: true — count VRAM from all devices per PID
+multi_gpu:
+  vram_aggregation:      sum
+  per_pid_vram_merge:    true
+  device_allowlist:      []   # empty = all devices; set [0,1] to exclude display GPU
+  placement_aware_kills: false
+
+# --- Protected processes ---
+protected_pids: [1]
+protected_names:
+  - sshd
+  - systemd
+  - journald
+  - nvidia-smi
+  - cron
+  - rsyslogd
+  - Xorg
+  - gnome-shell

@@ -1,0 +1,75 @@
+# Hermes Configuration — Tier A (CPU-only, conservative)
+#
+# Use this config on hosts with no GPU and no PSI support (e.g., a VM without
+# /proc/pressure or a vanilla cloud instance).  All GPU/VRAM and IO-PSI weights
+# are zeroed out; only CPU and memory signals drive the UPS.
+#
+# Thresholds are set conservatively (elevated=50, critical=80) so the system
+# reacts later but generates fewer false-positive interventions.  Level 1
+# reprioritization is the only permitted action.
+#
+# When to promote to Tier B:
+#   - The host has PSI enabled (/proc/pressure/cpu exists)
+#   - You have confirmed at least one observe-only run in artifacts/
+#   - hermes_eval shows false_positive_rate_per_hour < 5
+#
+# Reference: docs/calibration_guide.md, docs/tuning_guide.md
+
+version: 1
+
+# --- UPS weight profile for CPU-only hosts ---
+# VRAM and IO weights are zeroed; all weight goes to CPU/memory signals.
+# Sum: 0.50 + 0.50 = 1.00
+ups_weights:
+  cpu_some:  0.50   # Dominant signal on CPU-bound hosts
+  mem_some:  0.30   # Memory pressure still relevant
+  mem_full:  0.20   # Full-stall memory signal
+  gpu_util:  0.00   # No GPU — zeroed
+  vram_used: 0.00   # No VRAM — zeroed
+  io_full:   0.00   # IO-PSI not available at Tier A
+
+# --- Conservative thresholds ---
+# Raised by 10 points vs. default to reduce false positives on noisy CPU hosts.
+thresholds:
+  ups:
+    elevated: 50    # UPS >= 50 → ELEVATED  (default: 40)
+    critical: 80    # UPS >= 80 → CRITICAL  (default: 70)
+  mem_psi:
+    elevated_full_avg10: 3.0   # Allow more mem stall variance (default: 2.0)
+    critical_full_avg10: 8.0   # (default: 5.0)
+  vram:
+    high_pct:     100   # Effectively disabled — no GPU
+    critical_pct: 100
+  predictor:
+    high_risk: 0.80    # Higher bar for recommended intervention (default: 0.70)
+
+# --- Extended cooldowns for conservative mode ---
+cooldowns:
+  level_1_pid_sec:        20    # default: 15
+  level_2_pid_sec:        30    # default: 20 (level 2 disabled below, kept conservative)
+  level_3_global_sec:    600    # default: 300 — extra-long kill cooldown
+  recovery_hysteresis_sec: 20   # default: 10 — require longer low-UPS period
+
+# --- Actions: only observe and Level 1 reprioritization enabled ---
+actions:
+  enable_level_1: true     # setpriority (nice) — safe and reversible
+  enable_level_2: false    # SIGSTOP/SIGCONT — disabled at Tier A
+  enable_level_3: false    # SIGTERM/SIGKILL  — disabled at Tier A
+  observe_only_mode: true  # Start in observe-only; flip to false only after baseline review
+
+# --- Multi-GPU (not applicable at Tier A) ---
+multi_gpu:
+  vram_aggregation:    sum
+  per_pid_vram_merge:  true
+  device_allowlist:    []
+  placement_aware_kills: false
+
+# --- Protected processes ---
+protected_pids: [1]
+protected_names:
+  - sshd
+  - systemd
+  - journald
+  - nvidia-smi
+  - cron
+  - rsyslogd

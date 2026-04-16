@@ -15,6 +15,7 @@ add_library(hermes_core
     src/monitor/loadavg.cpp
     src/monitor/gpu_stats.cpp
     src/monitor/nvml_backend.cpp
+    src/monitor/rich_proc_reader.cpp
     src/monitor/io_psi.cpp
     src/monitor/vmstat.cpp
     src/profiler/proc_stat.cpp

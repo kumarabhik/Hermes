@@ -11,6 +11,7 @@
 //   hermesctl eval [dir]    Show offline predictor evaluation for a run directory
 //   hermesctl bench         List recent benchmark run summaries from artifacts/bench/
 //   hermesctl diff          Compare two eval_summary.json files side by side
+//   hermesctl schema [path] Print a formatted table of all tunable parameters in schema.yaml
 //
 // On non-Linux platforms, falls back to reading the most recent run directory
 // from artifacts/logs/ and printing a static summary.
@@ -752,6 +753,141 @@ int cmd_diff(const std::vector<std::string>& args, const std::string& artifact_r
     return 0;
 }
 
+// ---- schema subcommand: print a formatted table of config/schema.yaml parameters ----
+
+int cmd_schema(const std::vector<std::string>& args, const std::string& /*artifact_root*/) {
+    // Resolve config path: explicit arg, env var, or default.
+    std::string config_path;
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (!args[i].empty() && args[i][0] != '-') {
+            config_path = args[i];
+            break;
+        }
+    }
+    if (config_path.empty()) {
+        const char* env = std::getenv("HERMES_CONFIG_PATH");
+        config_path = (env && env[0] != '\0') ? env : "config/schema.yaml";
+    }
+
+    std::ifstream f(config_path);
+    if (!f.is_open()) {
+        std::cerr << "hermesctl schema: cannot open " << config_path << "\n";
+        std::cerr << "  Set HERMES_CONFIG_PATH or pass the config path as an argument.\n";
+        return 1;
+    }
+
+    // Parse the YAML line by line.  We extract key-value pairs from simple
+    // indented YAML without a full parser.  Only leaf scalar values are shown.
+    struct Row {
+        std::string section;   // current top-level key (ups_weights, thresholds, …)
+        std::string key;       // field name (indented key)
+        std::string value;     // scalar value
+        std::string comment;   // inline comment (stripped of leading # and whitespace)
+    };
+
+    std::vector<Row> rows;
+    std::string cur_section;
+    std::string cur_subsection;
+
+    auto strip = [](const std::string& s) {
+        std::size_t a = s.find_first_not_of(" \t");
+        std::size_t b = s.find_last_not_of(" \t\r\n");
+        if (a == std::string::npos) return std::string{};
+        return s.substr(a, b - a + 1);
+    };
+
+    std::string line;
+    while (std::getline(f, line)) {
+        // Skip blank lines and full-line comments.
+        const std::string trimmed = strip(line);
+        if (trimmed.empty() || trimmed[0] == '#') continue;
+
+        // Count leading spaces to determine indent level.
+        std::size_t indent = 0;
+        while (indent < line.size() && (line[indent] == ' ' || line[indent] == '\t'))
+            ++indent;
+
+        // Split at colon.
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string raw_key   = strip(line.substr(0, colon));
+        std::string remainder = (colon + 1 < line.size()) ? line.substr(colon + 1) : "";
+
+        // Strip inline comment from remainder.
+        std::string comment;
+        const auto hash = remainder.find('#');
+        if (hash != std::string::npos) {
+            comment   = strip(remainder.substr(hash + 1));
+            remainder = remainder.substr(0, hash);
+        }
+        std::string value = strip(remainder);
+
+        if (raw_key.empty()) continue;
+
+        if (indent == 0) {
+            cur_section    = raw_key;
+            cur_subsection.clear();
+            // Section header — no value row.
+            continue;
+        }
+
+        if (indent <= 2) {
+            // Could be a sub-section key (value is empty) or a direct leaf.
+            if (value.empty() && comment.empty()) {
+                cur_subsection = raw_key;
+                continue;
+            }
+        }
+
+        if (value.empty()) continue;  // intermediate key, no scalar
+
+        // Build a display key like "ups_weights.cpu_some" or "thresholds.ups.elevated".
+        std::string display_key;
+        if (!cur_section.empty())    display_key += cur_section;
+        if (!cur_subsection.empty()) display_key += "." + cur_subsection;
+        display_key += "." + raw_key;
+
+        rows.push_back({cur_section, display_key, value, comment});
+    }
+
+    if (rows.empty()) {
+        std::cout << "hermesctl schema: no parameters found in " << config_path << "\n";
+        return 0;
+    }
+
+    const std::string sep(90, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl schema — " << config_path << "\n";
+    std::cout << sep << "\n";
+    std::cout << std::left
+              << std::setw(48) << "Parameter"
+              << std::setw(18) << "Value"
+              << "Note\n";
+    std::cout << std::string(90, '-') << "\n";
+
+    std::string last_section;
+    for (const auto& row : rows) {
+        if (row.section != last_section) {
+            if (!last_section.empty()) std::cout << "\n";
+            last_section = row.section;
+        }
+        // Truncate long keys/values for readability.
+        const std::string k = row.key.size() > 47 ? row.key.substr(0, 44) + "..." : row.key;
+        const std::string v = row.value.size() > 17 ? row.value.substr(0, 14) + "..." : row.value;
+        std::cout << std::left
+                  << std::setw(48) << k
+                  << std::setw(18) << v
+                  << row.comment << "\n";
+    }
+
+    std::cout << sep << "\n";
+    std::cout << "  Edit " << config_path << " to adjust parameters.\n";
+    std::cout << "  Run smoke_schema.sh to validate after edits.\n";
+    std::cout << "  See docs/tuning_guide.md for safe adjustment procedure.\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -781,6 +917,10 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "diff") {
         return cmd_diff(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "schema") {
+        return cmd_schema(args, artifact_root);
     }
 
     if (!args.empty() && args[0] == "ping") {

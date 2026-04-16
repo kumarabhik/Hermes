@@ -16,7 +16,8 @@
 //   mixed_pressure   — moderate CPU + mem + IO all elevated simultaneously
 //   oom_imminent     — VRAM 99%+ AND mem_full_avg10 50+ AND cpu_full_avg10 90+
 //   recovery_resume  — critical pressure → abrupt drop → gradual pressure resume
-//   all              — generate all seven scenarios
+//   gpu_contention   — multi-GPU device contention: two virtual devices compete for VRAM
+//   all              — generate all eight scenarios
 //
 // Usage:
 //   hermes_fault [--out-dir artifacts/fault_injection] [--scenario <name>]
@@ -59,7 +60,8 @@ void print_usage() {
         << "Options:\n"
         << "  --out-dir <dir>      Output root (default: artifacts/fault_injection)\n"
         << "  --scenario <name>    One of: vram_spike, mem_storm, cpu_hog, io_storm,\n"
-        << "                               mixed_pressure, oom_imminent, recovery_resume, all\n"
+        << "                               mixed_pressure, oom_imminent, recovery_resume,\n"
+        << "                               gpu_contention, all\n"
         << "                       Default: all\n";
 }
 
@@ -451,6 +453,104 @@ std::vector<FaultSample> gen_recovery_resume() {
     return samples;
 }
 
+// Scenario 8: GPU device contention — simulates two virtual GPU devices competing
+// for VRAM and compute.  In real multi-GPU deployments, placement_aware_kills=true
+// uses per-device utilization to prefer killing processes on the hottest device.
+//
+// Three phases (total: 20 warmup + 70 fault samples):
+//   Phase 1 (30 samples): Device-0 training job fills VRAM 40% → 88%;
+//                         GPU util oscillates 80-98% (device switching pattern).
+//   Phase 2 (25 samples): Second job spills onto Device-1; combined VRAM crosses
+//                         90%, CPU PSI rises due to data-loader contention.
+//   Phase 3 (15 samples): Both devices near saturation — VRAM > 95%, CPU full.
+//                         Intervention window: placement-aware kill would target
+//                         the highest-util device's dominant consumer.
+std::vector<FaultSample> gen_gpu_contention() {
+    auto samples = make_warmup(20);
+    const int warmup = static_cast<int>(samples.size());
+    const double vram_total = 2.0 * 24576.0; // simulated 2× 24 GB = 48 GB aggregate
+
+    // Phase 1: Device 0 fills fast (30 samples)
+    const int phase1 = 30;
+    for (int i = 0; i < phase1; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(phase1 - 1);
+        FaultSample s;
+        const int idx = warmup + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.cpu_some_avg10 = 10.0 + 8.0 * t;
+        s.cpu_full_avg10 = 1.0  + 3.0 * t;
+        s.mem_some_avg10 = 5.0  + 4.0 * t;
+        s.mem_full_avg10 = 0.5  + 1.0 * t;
+        // GPU util oscillates: Device-0 busy training, Device-1 near idle.
+        s.gpu_util_pct   = 80.0 + 15.0 * std::sin(static_cast<double>(i) * 0.6);
+        // VRAM: Device-0 fills 40%→88% of its 24 GB; Device-1 at 20% (idle).
+        const double d0_vram = 24576.0 * (0.40 + 0.48 * t);
+        const double d1_vram = 24576.0 * 0.20;
+        s.vram_used_mb  = d0_vram + d1_vram;
+        s.vram_total_mb = vram_total;
+        s.vram_free_mb  = vram_total - s.vram_used_mb;
+        s.loadavg_runnable = 4 + static_cast<uint32_t>(4.0 * t);
+        s.vmstat_pgmajfault = 1100 + static_cast<uint64_t>(i) * 5;
+        s.vmstat_pgfault    = 52000 + static_cast<uint64_t>(i) * 600;
+        samples.push_back(s);
+    }
+
+    // Phase 2: Second job spills to Device-1; combined pressure rises (25 samples)
+    const int phase2 = 25;
+    for (int i = 0; i < phase2; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(phase2 - 1);
+        FaultSample s;
+        const int idx = warmup + phase1 + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.cpu_some_avg10 = 18.0 + 15.0 * t;
+        s.cpu_full_avg10 = 4.0  + 10.0 * t;
+        s.mem_some_avg10 = 9.0  + 12.0 * t;
+        s.mem_full_avg10 = 1.5  +  4.0 * t;
+        // Both GPUs busy; util increases as jobs contend for PCIe bandwidth.
+        s.gpu_util_pct   = 88.0 + 8.0 * t;
+        // Device-0 at 88%, Device-1 ramps 20%→70%.
+        const double d0_vram = 24576.0 * 0.88;
+        const double d1_vram = 24576.0 * (0.20 + 0.50 * t);
+        s.vram_used_mb  = d0_vram + d1_vram;
+        s.vram_total_mb = vram_total;
+        s.vram_free_mb  = vram_total - s.vram_used_mb;
+        s.loadavg_runnable = 8 + static_cast<uint32_t>(6.0 * t);
+        s.vmstat_pgmajfault = 1250 + static_cast<uint64_t>(i) * 20;
+        s.vmstat_pgfault    = 70000 + static_cast<uint64_t>(i) * 1500;
+        samples.push_back(s);
+    }
+
+    // Phase 3: Both devices saturated — VRAM > 95%, CPU full pressure (15 samples)
+    const int phase3 = 15;
+    for (int i = 0; i < phase3; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(phase3 - 1);
+        FaultSample s;
+        const int idx = warmup + phase1 + phase2 + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.cpu_some_avg10 = 33.0 + 15.0 * t;
+        s.cpu_full_avg10 = 14.0 + 20.0 * t;
+        s.mem_some_avg10 = 21.0 + 10.0 * t;
+        s.mem_full_avg10 = 5.5  +  6.0 * t;
+        // GPU util at max; scheduling latency causes jitter.
+        s.gpu_util_pct   = 96.0 + 3.0 * std::sin(static_cast<double>(i) * 1.2);
+        // Both devices > 95% VRAM.
+        const double d0_vram = 24576.0 * (0.95 + 0.03 * t);
+        const double d1_vram = 24576.0 * (0.95 + 0.03 * t);
+        s.vram_used_mb  = d0_vram + d1_vram;
+        s.vram_total_mb = vram_total;
+        s.vram_free_mb  = vram_total - s.vram_used_mb;
+        s.loadavg_runnable = 14 + static_cast<uint32_t>(4.0 * t);
+        s.vmstat_pgmajfault = 1750 + static_cast<uint64_t>(i) * 40;
+        s.vmstat_pgfault    = 107500 + static_cast<uint64_t>(i) * 3000;
+        samples.push_back(s);
+    }
+
+    return samples;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -485,6 +585,7 @@ int main(int argc, char** argv) {
         {"mixed_pressure",   "CPU + mem + IO all moderately elevated simultaneously",              gen_mixed_pressure},
         {"oom_imminent",     "VRAM 99%+ AND mem_full 50+ AND cpu_full 90+ — imminent OOM",        gen_oom_imminent},
         {"recovery_resume",  "Critical pressure -> abrupt drop -> gradual resume (tests recovery)", gen_recovery_resume},
+        {"gpu_contention",   "Multi-GPU device contention: two virtual devices compete for VRAM (tests placement-aware routing)", gen_gpu_contention},
     };
 
     int written = 0;

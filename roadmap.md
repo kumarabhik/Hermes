@@ -84,6 +84,17 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - `RESULTS.md` live evidence table updated: added Tier column (T0–T5) to all existing rows, added new T2/T3/T4/T5 pending rows, added Phase 6 Evidence Targets table mapping each tier to collection command.
 - `scripts/smoke_phase6.sh` added: bash automation for Phase 6a–d steps on Linux (live PSI monitor validation, fidelity workload + hermes_eval, hermes_tune.py calibration check, low-pressure false positive check); exits 0 only if all phases pass.
 - README "Key Results" section added as a clearly-labeled placeholder with before/after latency table, predictor quality table, and false positive row; will be populated once Linux benchmark runs complete.
+- `config/oom_stress_scenario.yaml` upgraded: Tier A/B foreground uses a tight Python math loop; Tier C block (commented) uses PyTorch CUDA inference loop; `vram_hog_bg` Tier C block also commented; `scenario_name` field added; stress-ng fallbacks added.
+- README Achieved Outcomes table upgraded: Tier column (T0–T5) added to both evidence tables; "Not yet evidenced" replaced with a table mapping each missing claim to its required tier and collection command.
+- `hermesctl bench` subcommand added: scans `artifacts/bench/` for `*-summary.json` files and prints a compact table (run-id, mode, p95, completion%, OOM, actions, lat-target pass/fail).
+- `hermesctl diff` subcommand added: accepts two eval_summary.json paths or run-ids; prints a side-by-side metric table with delta and "A/B/=" verdict; targets from design.md shown alongside.
+- `scripts/hermes_doctor.sh` added: Tier A/B/C host readiness diagnostic; checks /proc, PSI, cgroup v2, stress-ng, perf, strace, gdb, NVML library, PyTorch CUDA, and all Hermes binaries; prints colour-coded PASS/WARN/FAIL table with tier-specific next steps.
+- `docs/calibration_guide.md` added: 8-step runbook for the full predictor calibration cycle (run baseline, hermes_eval, hermes_tune.py, edit schema.yaml, verify synthetic fixture, iterate, FP check, record RESULTS.md).
+- `scripts/gen_evidence_report.sh` added: runs hermes_plot.py --summary + hermes_report + hermes_tune.py in sequence and writes combined plain-text evidence report to `artifacts/evidence_report.txt`.
+- `scripts/smoke_schema.sh` added: validates `config/schema.yaml` without requiring a build; checks required sections, UPS weight sum, threshold ranges, cooldown values, cross-field invariants (critical > elevated), and flags unknown keys.
+- `config/schema.yaml` extended with `multi_gpu` section: `vram_aggregation` (sum/max/mean), `per_pid_vram_merge`, `device_allowlist`, `placement_aware_kills`; documented in `docs/tuning_guide.md` Multi-GPU Placement Policy section.
+- `docs/tuning_guide.md` extended: Multi-GPU Placement Policy section added; `smoke_schema.sh` added as a 5th verification step before active-control promotion.
+- Documentation table in `README.md` should be updated to include `docs/calibration_guide.md`.
 - No benchmark run outputs with real ML jobs, `strace` captures, `perf` captures, eBPF traces, or `gdb` evidence exist yet.
 
 ## Phase 0: Project Bootstrap
@@ -183,7 +194,7 @@ This phase closes the gap between "the pipeline works" and "Hermes demonstrably 
 ### 6b — Workload Fidelity Upgrade
 
 - [x] Replace `echo smoke-*` commands in `config/baseline_scenario.yaml` and `config/observe_scenario.yaml` with real fidelity workloads: Python memory hog (≥ 2 GB) as background + tight compute loop as foreground; keep `_smoke` YAML variants for CI.
-- [ ] Update `config/oom_stress_scenario.yaml` foreground command to use the GPU inference loop template from the Workload Fidelity section of `design.md` when running on Tier C.
+- [x] Update `config/oom_stress_scenario.yaml` foreground command to use the GPU inference loop template from the Workload Fidelity section of `design.md` when running on Tier C. (Both CPU and GPU inference loop variants are now in the YAML with a comment to switch tiers; `scenario_name` field also fixed.)
 - [ ] Verify that at least one baseline run on the upgraded scenario produces `cpu_some_avg10 > 10` or `mem_some_avg10 > 10` in `samples.ndjson`, confirming real pressure was generated.
 
 ### 6c — Predictor Calibration
@@ -214,13 +225,13 @@ This phase closes the gap between "the pipeline works" and "Hermes demonstrably 
 ### 6g — Result Interpretation and README Claims
 
 - [~] Write a "Key Results" section in README summarising at least one concrete before/after metric (e.g. "active-control reduced p95 latency from X ms to Y ms and OOM events from N to M across 5 runs"). (Placeholder section with table structure added; real numbers pending Linux benchmark runs.)
-- [ ] Verify that every README performance claim cites a Tier (T1–T5) per the Benchmark Evidence Standards in `design.md`.
+- [x] Verify that every README performance claim cites a Tier (T1–T5) per the Benchmark Evidence Standards in `design.md`. (Achieved Outcomes table and "Not yet evidenced" table both have Tier column; claim rows added for T1–T5.)
 - [ ] Run `hermes_report` and `hermes_compare` on the full evidence set; save the comparison CSV to `artifacts/bench/final_comparison.csv` and link it from RESULTS.md.
 
 ## Stretch Goals
 
 - [x] Add I/O PSI to the control model and extend UPS beyond CPU, memory, and GPU.
-- [ ] Support multi-GPU attribution and placement-aware scheduling decisions.
+- [~] Support multi-GPU attribution and placement-aware scheduling decisions. (`NvmlBackend::query_all_processes()` merges per-PID VRAM across all GPUs; `config/schema.yaml` now has `multi_gpu` section with `vram_aggregation`, `per_pid_vram_merge`, `device_allowlist`, `placement_aware_kills`; placement-aware kill routing is scaffolded but `placement_aware_kills=false` by default until T4 evidence exists.)
 - [x] Add richer cgroup v2 controls such as `memory.high` and CPU quota tuning with rollback.
 - [ ] Build a lightweight web dashboard on top of the same event stream used by the CLI.
 - [x] Support benchmark replay comparisons across config versions (hermes_report CSV + hermes_reeval RMSE).

@@ -1961,3 +1961,22 @@ This section exists to keep future sessions grounded in verified state instead o
 - Verified artifacts: Files confirmed created/edited per above list; no build run in Windows authoring environment.
 - Roadmap counts after this session: [x] = 54, [~] = 12, [ ] = 17 → 83 total items (Phase 6 adds 22 items). Completion: 54/83 = 65% full, 60/83 = 72% if partial counts halfway.
 - Next window should: (1) Run `bash scripts/smoke_phase6.sh` on WSL2/Linux to collect T1–T4 evidence. (2) Run `python3 scripts/check_evidence_tiers.py` to verify tier status. (3) Run `hermes_bench config/baseline_scenario.yaml --runs 5 --run-id baseline-5run` then `hermes_bench config/oom_stress_scenario.yaml --runs 5 --hermes-bin build/hermesd --delta-vs artifacts/bench/baseline-5run-latency.json` to populate the Key Results table. (4) Capture strace + perf (scripts/bench_strace.sh + bench_perf.sh) during an active-control run for T5 evidence.
+
+#### 2026-04-17 IST - Context Window Summary (CW-6)
+
+- Context window covered: "Do the 10 steps and give me % complete" — seventh session.
+- Files changed:
+  - `config/oom_stress_scenario.yaml` — upgraded with Tier A/B CPU inference loop (foreground, measures per-iteration latency) and commented Tier C PyTorch CUDA loop + vram_hog_bg block; `scenario_name` field added; stress-ng `--quiet` flag and Python fallback comments added; `role:` field used instead of `foreground:/background:` booleans.
+  - `README.md` — Achieved Outcomes table: Tier column added to both evidence rows and "not evidenced" rows; "Not yet evidenced" list replaced with a three-column table (claim, tier needed, how to collect); `docs/calibration_guide.md` added to Documentation table.
+  - `src/cli/hermesctl.cpp` — `cmd_bench()` subcommand added: scans `artifacts/bench/` for `*-summary.json`, prints compact table (run-id, mode, p95, completion%, OOM, actions, lat verdict); `cmd_diff()` subcommand added: resolves two eval_summary paths, prints side-by-side metric table with delta and A/B/= verdict; both wired into main dispatch; header comment updated.
+  - `scripts/hermes_doctor.sh` (new) — Tier A/B/C host readiness diagnostic; PASS/WARN/FAIL per check; colour output; tier-aware next-step message; exit code = FAIL count.
+  - `docs/calibration_guide.md` (new) — 8-step predictor calibration runbook; covers eval, hermes_tune output, threshold adjustment reference table, synthetic fixture verification, false positive check, RESULTS.md entry template.
+  - `scripts/gen_evidence_report.sh` (new) — sequences check_evidence_tiers.py + hermes_plot.py --summary for each run dir + hermes_report + hermes_tune.py; writes combined report to `artifacts/evidence_report.txt`.
+  - `scripts/smoke_schema.sh` (new) — validates schema.yaml: required sections, UPS weight sum ≈ 1.0, threshold ranges, cooldown positivity, critical > elevated invariant, unknown key detection; accepts `--strict` flag.
+  - `config/schema.yaml` — `multi_gpu` section added: `vram_aggregation` (sum/max/mean), `per_pid_vram_merge`, `device_allowlist`, `placement_aware_kills`; all fields documented with comments.
+  - `docs/tuning_guide.md` — Multi-GPU Placement Policy section added with sensitivity table; Verifying Changes section updated to include `smoke_schema.sh` as step 5.
+  - `roadmap.md` — snapshot paragraph extended with all CW-6 additions; Phase 6b item 2 `[ ]` → `[x]` (oom_stress GPU template done); Phase 6g item 2 `[ ]` → `[x]` (README Tier citations done); Stretch multi-GPU `[ ]` → `[~]` (schema + query_all_processes scaffolded).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: All files confirmed created/edited; no build run in Windows authoring environment.
+- Roadmap counts after this session: [x] = 57, [~] = 13, [ ] = 16 → 86 total. Completion: 57/86 = 66% full, 63.5/86 = 74% if partial counts halfway.
+- Next window should: (1) Run `bash scripts/hermes_doctor.sh` to confirm host tier. (2) Run `bash scripts/smoke_schema.sh` to validate schema after multi_gpu addition. (3) Run `bash scripts/smoke_phase6.sh` on Linux to advance from T0 to T1–T4. (4) Run `hermesctl bench` and `hermesctl diff` on real benchmark artifacts once they exist. (5) Remaining `[ ]` items are all Linux-runtime dependent — the tooling to collect them is now complete.

@@ -9,6 +9,8 @@
 //   hermesctl status
 //   hermesctl nvml          Check NVML availability and print device summary
 //   hermesctl eval [dir]    Show offline predictor evaluation for a run directory
+//   hermesctl bench         List recent benchmark run summaries from artifacts/bench/
+//   hermesctl diff          Compare two eval_summary.json files side by side
 //
 // On non-Linux platforms, falls back to reading the most recent run directory
 // from artifacts/logs/ and printing a static summary.
@@ -424,6 +426,332 @@ int cmd_eval(const std::vector<std::string>& args, const std::string& artifact_r
     return 0;
 }
 
+// ---- bench subcommand: list recent benchmark run summaries ----
+
+int cmd_bench(const std::string& artifact_root) {
+    const std::string bench_dir = artifact_root + "/bench";
+
+    struct SummaryEntry {
+        std::string run_id;
+        std::string scenario;
+        std::string mode;
+        double p95_ms{-1.0};
+        double completion{-1.0};
+        int oom_count{-1};
+        int interventions{-1};
+        std::string lat_target_met; // "true"/"false"/"—"
+        std::string filename;
+    };
+
+    std::vector<SummaryEntry> entries;
+
+    auto jdbl = [](const std::string& s, const std::string& k) -> double {
+        const std::string search = "\"" + k + "\":";
+        const auto p = s.find(search);
+        if (p == std::string::npos) return -1.0;
+        const auto start = s.find_first_not_of(" \t", p + search.size());
+        if (start == std::string::npos) return -1.0;
+        if (s[start] == 'n') return -1.0;
+        try { return std::stod(s.substr(start)); } catch (...) { return -1.0; }
+    };
+    auto jstr = [](const std::string& s, const std::string& k) -> std::string {
+        const std::string search = "\"" + k + "\":\"";
+        const auto p = s.find(search);
+        if (p == std::string::npos) return "";
+        const auto start = p + search.size();
+        const auto end = s.find('"', start);
+        return end == std::string::npos ? "" : s.substr(start, end - start);
+    };
+    auto jint = [&jdbl](const std::string& s, const std::string& k) -> int {
+        const double v = jdbl(s, k);
+        return v < 0.0 ? -1 : static_cast<int>(v);
+    };
+
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    const std::string pattern = bench_dir + "\\*-summary.json";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string fname(fd.cFileName);
+            if (fname.size() > 13) {
+                std::ifstream f(bench_dir + "/" + fname);
+                if (f.is_open()) {
+                    std::string content((std::istreambuf_iterator<char>(f)),
+                                        std::istreambuf_iterator<char>());
+                    SummaryEntry e;
+                    e.filename = fname;
+                    e.run_id   = jstr(content, "run_id");
+                    e.scenario = jstr(content, "scenario_name");
+                    e.mode     = jstr(content, "runtime_mode");
+                    e.p95_ms   = jdbl(content, "p95_latency_ms");
+                    e.completion  = jdbl(content, "completion_rate");
+                    e.oom_count   = jint(content, "oom_count");
+                    e.interventions = jint(content, "intervention_count");
+                    const auto lp = content.find("\"latency_target_met\":");
+                    if (lp != std::string::npos) {
+                        const auto vs = content.find_first_not_of(" \t", lp + 21);
+                        if (vs != std::string::npos) {
+                            if (content.substr(vs, 4) == "true")  e.lat_target_met = "PASS";
+                            else if (content.substr(vs, 5) == "false") e.lat_target_met = "FAIL";
+                            else e.lat_target_met = "—";
+                        }
+                    } else { e.lat_target_met = "—"; }
+                    if (e.run_id.empty()) e.run_id = fname.substr(0, fname.size() - 13);
+                    entries.push_back(std::move(e));
+                }
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR* dir = opendir(bench_dir.c_str());
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            const std::string fname(ent->d_name);
+            if (fname.size() <= 13 || fname.substr(fname.size() - 13) != "-summary.json")
+                continue;
+            std::ifstream f(bench_dir + "/" + fname);
+            if (!f.is_open()) continue;
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            SummaryEntry e;
+            e.filename = fname;
+            e.run_id   = jstr(content, "run_id");
+            e.scenario = jstr(content, "scenario_name");
+            e.mode     = jstr(content, "runtime_mode");
+            e.p95_ms   = jdbl(content, "p95_latency_ms");
+            e.completion  = jdbl(content, "completion_rate");
+            e.oom_count   = jint(content, "oom_count");
+            e.interventions = jint(content, "intervention_count");
+            const auto lp = content.find("\"latency_target_met\":");
+            if (lp != std::string::npos) {
+                const auto vs = content.find_first_not_of(" \t", lp + 21);
+                if (vs != std::string::npos) {
+                    if (content.substr(vs, 4) == "true")  e.lat_target_met = "PASS";
+                    else if (content.substr(vs, 5) == "false") e.lat_target_met = "FAIL";
+                    else e.lat_target_met = "—";
+                }
+            } else { e.lat_target_met = "—"; }
+            if (e.run_id.empty()) e.run_id = fname.substr(0, fname.size() - 13);
+            entries.push_back(std::move(e));
+        }
+        closedir(dir);
+    }
+#endif
+
+    if (entries.empty()) {
+        std::cout << "hermesctl bench: no *-summary.json found in " << bench_dir << "\n";
+        std::cout << "  Run: hermes_bench <scenario.yaml> --run-id <id>\n";
+        return 0;
+    }
+
+    std::sort(entries.begin(), entries.end(),
+        [](const SummaryEntry& a, const SummaryEntry& b) {
+            return a.filename < b.filename;
+        });
+
+    const std::string sep(88, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl bench — " << entries.size() << " run(s) in " << bench_dir << "\n";
+    std::cout << sep << "\n";
+    std::cout << std::left
+              << std::setw(36) << "Run ID"
+              << std::setw(14) << "Mode"
+              << std::right
+              << std::setw(10) << "p95 (ms)"
+              << std::setw(8)  << "Done%"
+              << std::setw(6)  << "OOM"
+              << std::setw(8)  << "Actions"
+              << std::setw(6)  << "Lat\n";
+    std::cout << std::string(88, '-') << "\n";
+
+    std::cout << std::fixed << std::setprecision(1);
+    for (const auto& e : entries) {
+        const std::string p95_str  = e.p95_ms >= 0.0   ? std::to_string(static_cast<int>(e.p95_ms)) : "—";
+        const std::string done_str = e.completion >= 0.0
+            ? std::to_string(static_cast<int>(e.completion * 100)) + "%" : "—";
+        const std::string oom_str  = e.oom_count >= 0   ? std::to_string(e.oom_count) : "—";
+        const std::string int_str  = e.interventions >= 0 ? std::to_string(e.interventions) : "—";
+        const std::string rid = e.run_id.size() > 35 ? e.run_id.substr(0, 32) + "..." : e.run_id;
+        const std::string mode = e.mode.empty() ? "—" : e.mode;
+
+        std::cout << std::left
+                  << std::setw(36) << rid
+                  << std::setw(14) << mode
+                  << std::right
+                  << std::setw(10) << p95_str
+                  << std::setw(8)  << done_str
+                  << std::setw(6)  << oom_str
+                  << std::setw(8)  << int_str
+                  << std::setw(6)  << e.lat_target_met
+                  << "\n";
+    }
+    std::cout << sep << "\n";
+    return 0;
+}
+
+// ---- diff subcommand: side-by-side eval_summary comparison ----
+
+int cmd_diff(const std::vector<std::string>& args, const std::string& artifact_root) {
+    // Usage: hermesctl diff <path-or-run-A> <path-or-run-B>
+    // Paths can be: explicit eval_summary.json path, or a run directory containing one,
+    // or a short run-id suffix resolved under artifacts/logs/.
+
+    auto resolve_eval = [&](const std::string& arg) -> std::string {
+        // 1. Direct file path
+        {
+            std::ifstream f(arg);
+            if (f.is_open()) return arg;
+        }
+        // 2. Directory containing eval_summary.json
+        {
+            const std::string p = arg + "/eval_summary.json";
+            std::ifstream f(p);
+            if (f.is_open()) return p;
+        }
+        // 3. Run ID under artifacts/logs/
+        {
+            const std::string p = artifact_root + "/logs/" + arg + "/eval_summary.json";
+            std::ifstream f(p);
+            if (f.is_open()) return p;
+        }
+        return "";
+    };
+
+    // Collect the two positional args after "diff"
+    std::vector<std::string> positionals;
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (!args[i].empty() && args[i][0] != '-')
+            positionals.push_back(args[i]);
+    }
+
+    if (positionals.size() < 2) {
+        std::cerr << "hermesctl diff: requires two paths/run-ids\n"
+                  << "  Usage: hermesctl diff <eval-A> <eval-B>\n"
+                  << "         hermesctl diff artifacts/logs/run1/eval_summary.json \\\n"
+                  << "                       artifacts/logs/run2/eval_summary.json\n";
+        return 1;
+    }
+
+    const std::string path_a = resolve_eval(positionals[0]);
+    const std::string path_b = resolve_eval(positionals[1]);
+
+    if (path_a.empty()) {
+        std::cerr << "hermesctl diff: cannot find eval_summary.json for: " << positionals[0] << "\n";
+        return 1;
+    }
+    if (path_b.empty()) {
+        std::cerr << "hermesctl diff: cannot find eval_summary.json for: " << positionals[1] << "\n";
+        return 1;
+    }
+
+    auto read_file = [](const std::string& p) -> std::string {
+        std::ifstream f(p);
+        return std::string((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    };
+
+    const std::string ca = read_file(path_a);
+    const std::string cb = read_file(path_b);
+
+    auto jdbl = [](const std::string& s, const std::string& k) -> double {
+        const std::string search = "\"" + k + "\":";
+        const auto p = s.find(search);
+        if (p == std::string::npos) return -1.0;
+        const auto start = s.find_first_not_of(" \t", p + search.size());
+        if (start == std::string::npos) return -1.0;
+        if (s[start] == 'n') return -1.0;
+        try { return std::stod(s.substr(start)); } catch (...) { return -1.0; }
+    };
+    auto jbool = [](const std::string& s, const std::string& k) -> std::string {
+        const std::string search = "\"" + k + "\":";
+        const auto p = s.find(search);
+        if (p == std::string::npos) return "—";
+        const auto start = s.find_first_not_of(" \t", p + search.size());
+        if (start == std::string::npos) return "—";
+        if (s.substr(start, 4) == "true")  return "true";
+        if (s.substr(start, 5) == "false") return "false";
+        return "—";
+    };
+
+    struct Row {
+        std::string metric;
+        double va;
+        double vb;
+        bool lower_is_better;
+        std::string target_note;
+    };
+
+    const std::vector<Row> rows = {
+        {"precision",                   jdbl(ca,"precision"),                   jdbl(cb,"precision"),                   false, ">= 0.85"},
+        {"recall",                      jdbl(ca,"recall"),                      jdbl(cb,"recall"),                      false, ">= 0.80"},
+        {"f1",                          jdbl(ca,"f1"),                          jdbl(cb,"f1"),                          false, ">= 0.80"},
+        {"mean_lead_time_s",            jdbl(ca,"mean_lead_time_s"),            jdbl(cb,"mean_lead_time_s"),            false, ">= 3.0 s"},
+        {"false_positive_rate_per_hour",jdbl(ca,"false_positive_rate_per_hour"),jdbl(cb,"false_positive_rate_per_hour"),true,  "< 5/hr"},
+        {"true_positives",              jdbl(ca,"true_positives"),              jdbl(cb,"true_positives"),              false, ""},
+        {"false_positives",             jdbl(ca,"false_positives"),             jdbl(cb,"false_positives"),             true,  ""},
+        {"false_negatives",             jdbl(ca,"false_negatives"),             jdbl(cb,"false_negatives"),             true,  ""},
+        {"total_predictions",           jdbl(ca,"total_predictions"),           jdbl(cb,"total_predictions"),           false, ""},
+        {"observation_window_s",        jdbl(ca,"observation_window_s"),        jdbl(cb,"observation_window_s"),        false, ""},
+    };
+
+    const std::string label_a = positionals[0].size() > 28
+        ? "..." + positionals[0].substr(positionals[0].size() - 25) : positionals[0];
+    const std::string label_b = positionals[1].size() > 28
+        ? "..." + positionals[1].substr(positionals[1].size() - 25) : positionals[1];
+
+    const std::string data_a = jbool(ca, "data_available");
+    const std::string data_b = jbool(cb, "data_available");
+
+    const std::string sep(80, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl diff — eval_summary comparison\n";
+    std::cout << sep << "\n";
+    std::cout << "  A: " << path_a << "  (data_available=" << data_a << ")\n";
+    std::cout << "  B: " << path_b << "  (data_available=" << data_b << ")\n\n";
+
+    std::cout << std::left  << std::setw(32) << "Metric"
+              << std::right << std::setw(12) << label_a
+              << std::setw(12) << label_b
+              << std::setw(10) << "Delta"
+              << std::setw(8)  << "Better"
+              << std::setw(16) << "Target\n";
+    std::cout << std::string(80, '-') << "\n";
+
+    std::cout << std::fixed << std::setprecision(3);
+    for (const auto& row : rows) {
+        const bool has_a = row.va >= 0.0;
+        const bool has_b = row.vb >= 0.0;
+        const std::string sa = has_a ? [&]{ std::ostringstream os; os << std::fixed << std::setprecision(3) << row.va; return os.str(); }() : "—";
+        const std::string sb = has_b ? [&]{ std::ostringstream os; os << std::fixed << std::setprecision(3) << row.vb; return os.str(); }() : "—";
+
+        std::string delta_str = "—";
+        std::string better    = "—";
+        if (has_a && has_b) {
+            const double delta = row.vb - row.va;
+            std::ostringstream ds;
+            ds << std::fixed << std::setprecision(3) << (delta >= 0 ? "+" : "") << delta;
+            delta_str = ds.str();
+            if (delta == 0.0)         better = "=";
+            else if (row.lower_is_better) better = delta < 0.0 ? "B" : "A";
+            else                          better = delta > 0.0 ? "B" : "A";
+        }
+
+        std::cout << std::left  << std::setw(32) << row.metric
+                  << std::right << std::setw(12) << sa
+                  << std::setw(12) << sb
+                  << std::setw(10) << delta_str
+                  << std::setw(8)  << better
+                  << std::setw(16) << row.target_note << "\n";
+    }
+    std::cout << sep << "\n";
+    std::cout << "  Legend: Better = which file is better (A or B); = means equal.\n";
+    std::cout << "          Targets from design.md Predictor Calibration Cycle.\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -445,6 +773,14 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "eval") {
         return cmd_eval(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "bench") {
+        return cmd_bench(artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "diff") {
+        return cmd_diff(args, artifact_root);
     }
 
     if (!args.empty() && args[0] == "ping") {

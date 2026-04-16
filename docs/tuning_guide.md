@@ -157,6 +157,53 @@ After modifying either list, restart the daemon — the config is loaded at star
 
 ---
 
+## Multi-GPU Placement Policy
+
+```yaml
+multi_gpu:
+  vram_aggregation: sum        # sum | max | mean
+  per_pid_vram_merge: true
+  device_allowlist: []         # empty = all devices
+  placement_aware_kills: false
+```
+
+These fields only affect Tier C (multi-GPU) hosts. On single-GPU or CPU-only hosts they are
+silently ignored.
+
+### `vram_aggregation`
+
+Controls how total VRAM pressure is combined across devices when computing the UPS score:
+
+| Value | Meaning | When to use |
+| --- | --- | --- |
+| `sum` | Total bytes used across all GPUs divided by total capacity (default) | Conservative; reacts to total VRAM headroom |
+| `max` | Worst single-device fill percentage | Useful when one GPU is a bottleneck |
+| `mean` | Average fill across all GPUs | Lower sensitivity; suitable for balanced multi-GPU workloads |
+
+### `per_pid_vram_merge`
+
+When `true` (default), `process_mapper` sums VRAM from all devices for each PID. A process
+using 2 GB on each of 2 GPUs counts as 4 GB total. Set to `false` if you want to attribute
+each process only to its dominant GPU.
+
+### `device_allowlist`
+
+List of device indices to monitor. Empty list (default) monitors all devices. Useful for
+excluding a GPU reserved for display or inference-only work:
+
+```yaml
+multi_gpu:
+  device_allowlist: [0, 1]   # only monitor GPU 0 and GPU 1 on a 4-GPU host
+```
+
+### `placement_aware_kills`
+
+**Experimental.** When `true`, Hermes prefers to throttle the process on the GPU with the
+highest utilisation rather than selecting globally by VRAM. Leave `false` until T4 evidence
+exists showing this improves outcomes on your specific topology.
+
+---
+
 ## Verifying Changes
 
 After any config change:
@@ -165,5 +212,6 @@ After any config change:
 2. Run `hermes_reeval` on a recent saved run directory to compare match rates.
 3. Check `eval_summary.json` from `hermes_eval` for precision/recall impact.
 4. Check `latency_summary.json` to verify policy loop p95 latency has not increased.
+5. Run `bash scripts/smoke_schema.sh` to validate the edited schema before restarting.
 
-Only promote the change to a live active-control run once all four checks pass.
+Only promote the change to a live active-control run once all five checks pass.

@@ -179,7 +179,8 @@ hermesctl nvml
 | --- | --- |
 | [docs/operator.md](docs/operator.md) | Deployment assumptions, privilege modes, safety guardrails, benchmark procedure |
 | [docs/internals.md](docs/internals.md) | Native collector path, multi-threaded daemon, replay, fault injection, cgroup backend |
-| [docs/tuning_guide.md](docs/tuning_guide.md) | UPS weights, thresholds, cooldowns, protection rules — safe adjustment procedure |
+| [docs/tuning_guide.md](docs/tuning_guide.md) | UPS weights, thresholds, cooldowns, multi-GPU placement, protection rules — safe adjustment procedure |
+| [docs/calibration_guide.md](docs/calibration_guide.md) | Step-by-step predictor calibration runbook: eval → hermes_tune → schema edit → verify → iterate |
 | [docs/wsl2_quickstart.md](docs/wsl2_quickstart.md) | WSL2 build guide, PSI/NVML setup, smoke suite, perf/strace capture, compatibility table |
 | [design.md](design.md) | Architecture, intervention policy, session handoff log |
 | [roadmap.md](roadmap.md) | Phase-by-phase status with `[x]`/`[~]`/`[ ]` evidence tracking |
@@ -188,34 +189,38 @@ hermesctl nvml
 
 The following outcomes are evidenced by artifacts in this repo and smoke run outputs.
 All smoke runs use direct `g++` compilation on Windows (no Linux GPU required).
+Each row is tagged with its [evidence tier](design.md) — T0 = pipeline correct, T1 = live monitors, T2 = predictor fires, T3 = intervention fires, T4 = intervention helps, T5 = defensible.
 
-| Capability | Evidence artifact or binary |
-| --- | --- |
-| Observe-only daemon artifact set | `smoke_daemon_replay.ps1` → `artifacts/logs/*/` |
-| Deterministic synthetic replay | `smoke_synthetic_replay.ps1` → `artifacts/logs/synthetic-*/` |
-| Benchmark plan artifacts | `smoke_benchmark_plan.ps1` → `artifacts/bench/*-plan.json` |
-| Bounded workload launch + summary | `smoke_benchmark_launch.ps1` → `artifacts/bench/*-summary.json` |
-| Benchmark + Hermes observe-only | `smoke_benchmark_hermes.ps1` → `artifacts/bench/*-summary.json` with embedded replay snapshot |
-| Baseline vs observe-only comparison | `smoke_benchmark_compare.ps1` → `artifacts/bench/comparison.csv` |
-| Offline predictor evaluation | `hermes_eval` → `eval_summary.json` |
-| Fault injection fixtures | `hermes_fault` → `artifacts/fault/` |
-| Multi-run replay comparison | `hermes_report` → console table + CSV |
+| Capability | Tier | Evidence artifact or binary |
+| --- | --- | --- |
+| Observe-only daemon artifact set | T0 | `smoke_daemon_replay.ps1` → `artifacts/logs/*/` |
+| Deterministic synthetic replay | T0 | `smoke_synthetic_replay.ps1` → `artifacts/logs/synthetic-*/` |
+| Benchmark plan artifacts | T0 | `smoke_benchmark_plan.ps1` → `artifacts/bench/*-plan.json` |
+| Bounded workload launch + summary | T0 | `smoke_benchmark_launch.ps1` → `artifacts/bench/*-summary.json` |
+| Benchmark + Hermes observe-only | T0 | `smoke_benchmark_hermes.ps1` → `artifacts/bench/*-summary.json` with embedded replay snapshot |
+| Baseline vs observe-only comparison | T0 | `smoke_benchmark_compare.ps1` → `artifacts/bench/comparison.csv` |
+| Offline predictor evaluation | T0 | `hermes_eval` → `eval_summary.json` |
+| Fault injection fixtures | T0 | `hermes_fault` → `artifacts/fault/` |
+| Multi-run replay comparison | T0 | `hermes_report` → console table + CSV |
 
 **Also evidenced (smoke environment):**
 
-| Capability | Evidence artifact or binary |
-| --- | --- |
-| NVML direct GPU fast path | `hermesctl nvml` → device info without nvidia-smi subprocess |
-| Active-control end-to-end smoke | `smoke_active_control.ps1` → `artifacts/bench/*-summary.json` with `latency_target_met` |
-| Scheduler state transition coverage | `hermes_reeval` → `artifacts/logs/*/state_coverage.json` |
-| p95 latency assertion in summaries | `hermes_bench` → `p95_latency_ms`, `latency_target_ms`, `latency_target_met` in summary JSON |
+| Capability | Tier | Evidence artifact or binary |
+| --- | --- | --- |
+| NVML direct GPU fast path (no subprocess) | T0 | `hermesctl nvml` → device info without nvidia-smi subprocess |
+| Active-control end-to-end smoke | T0 | `smoke_active_control.ps1` → `artifacts/bench/*-summary.json` with `latency_target_met` |
+| Scheduler state transition coverage | T0 | `hermes_reeval` → `artifacts/logs/*/state_coverage.json` |
+| p95 latency assertion in summaries | T0 | `hermes_bench` → `p95_latency_ms`, `latency_target_ms`, `latency_target_met` in summary JSON |
 
 **Not yet evidenced** (requires Linux / WSL2 with real workloads):
 
-- Real PSI readings under production workload pressure
-- NVML fast path with a real GPU (CUDA for WSL2 or native Linux)
-- Active-control intervention reducing p95 latency vs. baseline
-- `strace` / `perf stat` / `gdb` captures from live benchmark runs
+| Claim | Tier needed | How to collect |
+| --- | --- | --- |
+| Real PSI readings under pressure | T1 | `bash scripts/smoke_phase6.sh` on Linux |
+| NVML fast path with a real GPU | T1 | `hermesctl nvml` on CUDA WSL2 / native Linux |
+| Predictor fires under real pressure | T2 | `hermes_eval` on a fidelity workload run |
+| Active-control intervention reduces p95 latency | T4 | `hermes_bench --runs 5 --delta-vs baseline-summary.json` |
+| `strace` / `perf stat` captures | T5 | `scripts/bench_strace.sh`, `scripts/bench_perf.sh` |
 
 Run `bash scripts/collect_wsl2_evidence.sh` to collect all evidence in one pass on WSL2.
 

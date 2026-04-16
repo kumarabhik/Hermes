@@ -34,3 +34,27 @@ actions:
   enable_level_2: false
   enable_level_3: false
   observe_only_mode: true
+
+# Multi-GPU placement and attribution policy.
+# These fields are read by NvmlBackend and process_mapper.
+# They have no effect on single-GPU hosts.
+multi_gpu:
+  # How to aggregate VRAM pressure across devices when computing UPS:
+  #   sum    — total used VRAM across all GPUs (default; most conservative)
+  #   max    — worst-case single-device fill percentage
+  #   mean   — average fill across devices (least sensitive)
+  vram_aggregation: sum
+
+  # Whether process_mapper should merge per-PID VRAM across all GPUs.
+  # true  = a process using 2 GB on each of 2 GPUs counts as 4 GB total (default).
+  # false = only the GPU with the highest usage per PID is counted.
+  per_pid_vram_merge: true
+
+  # Device indices to include in monitoring (empty = all devices).
+  # Example: [0, 1]  monitors only devices 0 and 1 on a 4-GPU host.
+  device_allowlist: []
+
+  # If true, Hermes will prefer to throttle/kill processes on the GPU device
+  # with the highest current utilisation rather than picking the highest-VRAM
+  # consumer globally.  Experimental — leave false until T4 evidence exists.
+  placement_aware_kills: false

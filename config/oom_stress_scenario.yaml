@@ -10,6 +10,13 @@
 #   - p95 latency < 8000 ms
 #   - completion_rate >= 0.85
 #
+# TIER SELECTION:
+#   This file has two foreground workload variants — use whichever matches
+#   your host tier:
+#     Tier A/B (no GPU): inference_fg_cpu (Python math loop, default enabled)
+#     Tier C   (GPU):    inference_fg_gpu (PyTorch CUDA loop, swap in manually)
+#   Comment/uncomment the two inference_fg workload blocks to switch tiers.
+#
 # Usage:
 #   hermes_bench config/oom_stress_scenario.yaml \
 #       --hermes-bin build/hermesd \
@@ -20,12 +27,13 @@
 #
 # Prerequisites (Linux / WSL2):
 #   apt install stress-ng python3
+#   # Tier C only: pip install torch  (CUDA WSL2 driver required)
 #
 # To compare against baseline (no Hermes), run the baseline scenario first:
 #   hermes_bench config/baseline_scenario.yaml --runs 3
 #   hermes_bench config/oom_stress_scenario.yaml --runs 3 --auto-compare
 
-name: oom-stress-intervention
+scenario_name: oom-stress-intervention
 runtime_mode: active-control
 warmup_s: 5
 measurement_s: 60
@@ -42,30 +50,93 @@ expected_max_p95_latency_ms: 8000
 expected_min_job_completion_rate: 0.85
 
 workloads:
-  # Foreground: latency-sensitive inference job (Hermes must protect this).
+  # ---- Foreground (Tier A/B): CPU-only inference loop ----
+  # Tight math loop measuring its own per-iteration latency.
+  # Use this on any Linux host without a GPU.
   - name: inference_fg
-    command: "python3 -c \"import time, sys; buf=[bytearray(50*1024*1024) for _ in range(20)]; [time.sleep(0.5) for _ in range(20)]; print('inference done')\""
-    foreground: true
-    background: false
-    duration_s: 60
+    role: foreground
+    command: >
+      python3 -c "
+      import time, math
+      for i in range(400):
+          t0 = time.monotonic()
+          _ = [math.sqrt(x * 1.0001) for x in range(4000)]
+          elapsed_ms = (time.monotonic() - t0) * 1000
+          if i % 50 == 0:
+              print(f'iter {i} lat_ms {elapsed_ms:.1f}', flush=True)
+          time.sleep(0.01)
+      "
+    # Smoke fallback: command: "python3 -c \"import time; time.sleep(40)\""
+    duration_s: 50
+    expected_exit_code: 0
+
+  # ---- Foreground (Tier C): GPU inference loop (PyTorch required) ----
+  # Uncomment this block and comment out inference_fg above when running on
+  # a host with a CUDA GPU and PyTorch installed.
+  # Replace 4 with (available_vram_gb - 2) to leave headroom for the OS.
+  #
+  # - name: inference_fg
+  #   role: foreground
+  #   command: >
+  #     python3 -c "
+  #     import torch, time, math
+  #     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  #     print(f'device: {device}', flush=True)
+  #     model = torch.nn.Linear(4096, 4096).to(device)
+  #     x = torch.randn(32, 4096).to(device)
+  #     for i in range(200):
+  #         t0 = time.monotonic()
+  #         with torch.no_grad():
+  #             _ = model(x)
+  #         if device == 'cuda':
+  #             torch.cuda.synchronize()
+  #         lat_ms = (time.monotonic() - t0) * 1000
+  #         if i % 25 == 0:
+  #             print(f'iter {i} lat_ms {lat_ms:.1f}', flush=True)
+  #         time.sleep(0.05)
+  #     "
+  #   duration_s: 55
+  #   expected_exit_code: 0
+
+  # ---- Foreground (Tier C): VRAM hog alongside inference ----
+  # Uncomment when running on GPU to consume VRAM and force NVML pressure.
+  # Replace 4 with (available_vram_gb - 2).
+  #
+  # - name: vram_hog_bg
+  #   role: background
+  #   command: >
+  #     python3 -c "
+  #     import torch, time
+  #     t = torch.ones(4 * 1024**3 // 4, device='cuda')
+  #     time.sleep(65)
+  #     "
+  #   duration_s: 65
+  #   expected_exit_code: 0
 
   # Background: stress-ng virtual memory hog (triggers PSI + potential OOM).
   - name: mem_hog_stress
-    command: "stress-ng --vm 2 --vm-bytes 512M --timeout 60s"
-    foreground: false
-    background: true
+    role: background
+    command: "stress-ng --vm 2 --vm-bytes 512M --timeout 60s --quiet"
+    # Python fallback: command: "python3 -c \"import time; buf=bytearray(512*1024*1024); time.sleep(55)\""
     duration_s: 60
+    expected_exit_code: 0
 
   # Background: Python large allocation that holds memory for the full run.
   - name: mem_hog_python
-    command: "python3 -c \"import time; buf=bytearray(800*1024*1024); time.sleep(55)\""
-    foreground: false
-    background: true
+    role: background
+    command: >
+      python3 -c "
+      import time
+      buf = bytearray(800 * 1024 * 1024)
+      time.sleep(55)
+      "
     duration_s: 60
+    expected_exit_code: 0
 
   # Background: CPU pressure to push PSI scores and trigger UPS elevation.
   - name: cpu_pressure
-    command: "stress-ng --cpu 2 --timeout 60s"
-    foreground: false
-    background: true
+    role: background
+    command: "stress-ng --cpu 2 --timeout 60s --quiet"
+    # Python fallback: command: "python3 -c \"import math; [math.factorial(50000) for _ in range(5000)]\""
     duration_s: 60
+    expected_exit_code: 0

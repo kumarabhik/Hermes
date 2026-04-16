@@ -1,0 +1,62 @@
+# Hermes observe-only scenario — identical workloads to baseline_scenario.yaml
+# but with Hermes running in observe-only mode alongside them.
+#
+# Hermes records every UPS, risk, and decision into the run directory without
+# taking any host-mutating action. The benchmark summary embeds a replay
+# snapshot so you can compare peak_ups and intervention_count against the
+# active-control run.
+#
+# Usage:
+#   hermes_bench config/observe_scenario.yaml \
+#       --run-id observe-001 \
+#       --hermes-bin build/hermesd \
+#       --replay-bin build/hermes_replay
+
+scenario_name: observe-only
+runtime_mode: observe-only
+warmup_s: 10
+measurement_s: 60
+repeat_count: 1
+
+# Latency / completion targets.
+expected_max_p95_latency_ms: 10000
+expected_min_job_completion_rate: 0.90
+expected_max_oom_count: 0
+
+# Hermes UPS thresholds (observe mode — proposed actions logged but not fired).
+ups_elevated_threshold: 40
+ups_critical_threshold: 70
+
+# Workloads — mirror of baseline_scenario.yaml for apples-to-apples comparison.
+workloads:
+  - name: inference_fg
+    role: foreground
+    command: >
+      python3 -c "
+      import time, math
+      for i in range(500):
+          _ = [math.sqrt(x * 1.0001) for x in range(5000)]
+          time.sleep(0.005)
+      "
+    # Smoke fallback: command: "python3 -c \"import time; time.sleep(30)\""
+    duration_s: 40
+    expected_exit_code: 0
+
+  - name: mem_hog_bg
+    role: background
+    command: >
+      python3 -c "
+      import time
+      buf = bytearray(2 * 1024 * 1024 * 1024)
+      time.sleep(70)
+      "
+    # Smoke fallback: command: "python3 -c \"import time; time.sleep(60)\""
+    duration_s: 60
+    expected_exit_code: 0
+
+  - name: cpu_stress_bg
+    role: background
+    command: "stress-ng --cpu 2 --timeout 50s --quiet"
+    # Python fallback: command: "python3 -c \"import math; [math.factorial(50000) for _ in range(10000)]\""
+    duration_s: 55
+    expected_exit_code: 0

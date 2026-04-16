@@ -5,7 +5,12 @@
 // and compares each replayed decision to the original decisions.ndjson.
 //
 // Writes replay_eval.ndjson with per-frame match/mismatch results and
-// prints an aggregate summary (action match rate, state match rate).
+// prints an aggregate summary (action match rate, state match rate,
+// scheduler state transition coverage).
+//
+// Also writes state_coverage.json listing which scheduler states and
+// transitions were visited during replay — useful for verifying that a
+// fixture or run exercises the expected state-machine paths.
 //
 // NOTE: Process-level data (processes.ndjson) is not replayed in this
 // version — OomPredictor receives an empty process list. UPS, risk score,
@@ -20,11 +25,14 @@
 #include "hermes/engine/pressure_score.hpp"
 #include "hermes/engine/scheduler.hpp"
 
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -83,6 +91,80 @@ hermes::PressureSample parse_sample(const std::string& line) {
     s.vmstat_pgfault    = jull(line, "vmstat_pgfault");
     return s;
 }
+
+// ---------------------------------------------------------------------------
+// Scheduler state transition coverage tracker
+// ---------------------------------------------------------------------------
+
+static const std::array<hermes::SchedulerState, 5> kAllStates = {{
+    hermes::SchedulerState::Normal,
+    hermes::SchedulerState::Elevated,
+    hermes::SchedulerState::Throttled,
+    hermes::SchedulerState::Recovery,
+    hermes::SchedulerState::Cooldown
+}};
+
+struct StateCoverageTracker {
+    std::map<hermes::SchedulerState, uint64_t> state_counts;
+    // Transition key: (from_state, to_state) → count  (only actual transitions, not self-loops).
+    std::map<std::pair<hermes::SchedulerState, hermes::SchedulerState>, uint64_t> transition_counts;
+
+    hermes::SchedulerState prev_state{hermes::SchedulerState::Normal};
+    bool first{true};
+
+    void record(hermes::SchedulerState current) {
+        state_counts[current]++;
+        if (!first && current != prev_state) {
+            transition_counts[{prev_state, current}]++;
+        }
+        first    = false;
+        prev_state = current;
+    }
+
+    std::size_t states_visited() const { return state_counts.size(); }
+
+    // Write state_coverage.json to the given directory.
+    bool write_json(const std::filesystem::path& dir, std::string& error) const {
+        const std::filesystem::path path = dir / "state_coverage.json";
+        std::ofstream out(path);
+        if (!out.is_open()) {
+            error = "cannot write " + path.string();
+            return false;
+        }
+
+        out << "{\n";
+
+        // States visited.
+        out << "  \"states_visited\": " << states_visited() << ",\n";
+        out << "  \"states_total\": "   << kAllStates.size() << ",\n";
+        out << "  \"state_counts\": {\n";
+        for (std::size_t i = 0; i < kAllStates.size(); ++i) {
+            const hermes::SchedulerState s = kAllStates[i];
+            const auto it = state_counts.find(s);
+            const uint64_t cnt = (it != state_counts.end()) ? it->second : 0u;
+            out << "    \"" << hermes::to_string(s) << "\": " << cnt;
+            out << (i + 1 < kAllStates.size() ? ",\n" : "\n");
+        }
+        out << "  },\n";
+
+        // Transitions observed.
+        out << "  \"transitions_observed\": " << transition_counts.size() << ",\n";
+        out << "  \"transitions\": [\n";
+        bool first_t = true;
+        for (const auto& kv : transition_counts) {
+            if (!first_t) out << ",\n";
+            out << "    {\"from\":\"" << hermes::to_string(kv.first.first)
+                << "\",\"to\":\"" << hermes::to_string(kv.first.second)
+                << "\",\"count\":" << kv.second << "}";
+            first_t = false;
+        }
+        if (!transition_counts.empty()) out << "\n";
+        out << "  ]\n";
+
+        out << "}\n";
+        return out.good();
+    }
+};
 
 void print_usage() {
     std::cout
@@ -172,6 +254,8 @@ int main(int argc, char** argv) {
     double risk_sum_sq_err = 0.0;
     uint64_t metric_count  = 0;
 
+    StateCoverageTracker coverage;
+
     std::string sample_line;
     while (std::getline(samples_f, sample_line)) {
         if (sample_line.empty()) continue;
@@ -184,6 +268,8 @@ int main(int argc, char** argv) {
         const std::string replayed_action = hermes::to_string(decision.action);
         const std::string replayed_state  = hermes::to_string(decision.scheduler_state);
         const std::string replayed_band   = hermes::to_string(score.band);
+
+        coverage.record(decision.scheduler_state);
 
         // Compare against recorded if available
         const bool has_recorded = (frame_id < recorded_lines.size());
@@ -268,6 +354,30 @@ int main(int argc, char** argv) {
         std::cout << "Risk RMSE       : " << risk_rmse << "\n";
     }
     std::cout << "Output          : " << out_path.string() << "\n";
+
+    // ---- State coverage ----
+    std::cout << "\n=== Scheduler State Coverage ===\n";
+    std::cout << "States visited  : " << coverage.states_visited()
+              << "/" << kAllStates.size() << "\n";
+    for (const hermes::SchedulerState s : kAllStates) {
+        const auto it = coverage.state_counts.find(s);
+        const uint64_t cnt = (it != coverage.state_counts.end()) ? it->second : 0u;
+        std::cout << "  " << hermes::to_string(s) << ": " << cnt << " frames\n";
+    }
+    std::cout << "Transitions     : " << coverage.transition_counts.size() << " unique\n";
+    for (const auto& kv : coverage.transition_counts) {
+        std::cout << "  " << hermes::to_string(kv.first.first)
+                  << " -> " << hermes::to_string(kv.first.second)
+                  << " : " << kv.second << "\n";
+    }
+
+    std::string cov_error;
+    if (coverage.write_json(run_dir, cov_error)) {
+        std::cout << "Coverage JSON   : " << (run_dir / "state_coverage.json").string() << "\n";
+    } else {
+        std::cerr << "hermes_reeval: warning: could not write state_coverage.json: "
+                  << cov_error << "\n";
+    }
 
     return 0;
 }

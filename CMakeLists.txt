@@ -14,6 +14,7 @@ add_library(hermes_core
     src/monitor/mem_psi.cpp
     src/monitor/loadavg.cpp
     src/monitor/gpu_stats.cpp
+    src/monitor/nvml_backend.cpp
     src/monitor/io_psi.cpp
     src/monitor/vmstat.cpp
     src/profiler/proc_stat.cpp
@@ -38,10 +39,11 @@ add_library(hermes_core
 )
 target_include_directories(hermes_core PUBLIC include)
 
-# Link pthreads on Linux for event_bus (header-only but mutex/cv require it)
+# Link pthreads on Linux for event_bus (header-only but mutex/cv require it).
+# Link dl for dlopen used by NvmlBackend runtime loading.
 if(UNIX)
     find_package(Threads REQUIRED)
-    target_link_libraries(hermes_core PUBLIC Threads::Threads)
+    target_link_libraries(hermes_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
 # Main Daemon Executable
@@ -54,6 +56,9 @@ target_link_libraries(hermesd_mt PRIVATE hermes_core)
 
 # Live Control Dashboard CLI
 add_executable(hermesctl src/cli/hermesctl.cpp)
+if(UNIX)
+    target_link_libraries(hermesctl PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # Replay Summary CLI
 add_executable(hermes_replay src/cli/hermes_replay.cpp)
@@ -79,3 +84,49 @@ target_link_libraries(hermes_bench PRIVATE hermes_core)
 
 # Multi-run Artifact Report Generator CLI (standalone)
 add_executable(hermes_report src/cli/hermes_report.cpp)
+
+# Benchmark Comparison Aggregator CLI (standalone)
+add_executable(hermes_compare src/cli/hermes_compare.cpp)
+
+# ---------------------------------------------------------------------------
+# Install targets
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+
+install(TARGETS
+    hermesd
+    hermesd_mt
+    hermesctl
+    hermes_replay
+    hermes_reeval
+    hermes_synth
+    hermes_fault
+    hermes_eval
+    hermes_bench
+    hermes_report
+    hermes_compare
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(TARGETS hermes_core
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.hpp"
+)
+
+install(FILES config/schema.yaml
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/hermes
+)
+
+install(PROGRAMS
+    scripts/bench_strace.sh
+    scripts/bench_perf.sh
+    scripts/bench_gdb.sh
+    scripts/smoke_wsl2.sh
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/hermes/scripts
+    OPTIONAL
+)

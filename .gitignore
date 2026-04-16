@@ -73,3 +73,6 @@ artifacts/replay/*
 !artifacts/replay/.gitkeep
 artifacts/profiles/*
 !artifacts/profiles/.gitkeep
+
+# Claude Code memory / session files
+.claude/

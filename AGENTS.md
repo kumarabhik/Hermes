@@ -16,6 +16,26 @@
 - The daemon is an infinite loop by default. Use `HERMES_MAX_LOOPS=1` or another small value for smoke runs.
 - Do not claim native PSI, NVML, perf, eBPF, strace, or GPU benchmark behavior unless those artifacts exist in the repo.
 
+## Context Window Log Rule
+
+After each context window (token budget exhausted or session end), append a
+**Context Window Summary** entry to `design.md` under the Session Handoff Log.
+
+Format:
+
+```markdown
+#### YYYY-MM-DD IST - Context Window N Summary
+- Context window covered: <brief description of what this window was used for>
+- Files changed: <list of files modified or created>
+- State on exit: <what was completed, what was mid-flight>
+- Verified artifacts: <any artifact paths confirmed to exist>
+- Assumptions made: <anything inferred rather than directly verified>
+- Next window should: <first action for the next session>
+```
+
+This is lighter than a full pass entry. Its purpose is to prevent hallucination
+across compressed context — always write it before token exhaustion, not after.
+
 ## Artifact Rules
 
 - Runtime and benchmark artifacts belong under `artifacts/`.

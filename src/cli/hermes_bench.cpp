@@ -1,28 +1,26 @@
-// hermes_bench: Benchmark scenario launcher stub.
+// hermes_bench: Benchmark scenario launcher.
 //
 // Reads a scenario YAML config, validates it, writes a benchmark plan artifact,
-// can launch a bounded benchmark workload run with a summary artifact, and
-// can optionally launch hermesd plus hermes_replay around non-baseline runs.
+// launches bounded workloads with optional Hermes daemon orchestration and
+// replay summary capture, and writes enriched benchmark summary artifacts.
 //
-// Current status (Phase 4 scaffold):
-//   - Scenario config loading and validation are implemented.
-//   - Plan artifacts are written under artifacts/bench/.
-//   - Bounded workload launch and run summary artifacts are implemented.
-//   - Optional Hermes daemon orchestration and replay summary capture are
-//     implemented for non-baseline runtime modes.
-//   - Rich benchmark evidence collection is still pending.
+// Summary artifacts include: completion_rate, intervention_count (from replay
+// snapshot actions), oom_count (placeholder), degraded_behavior flag, and
+// comparison-ready fields for baseline vs observe-only vs active-control runs.
 //
 // Usage:
 //   hermes_bench <scenario_config.yaml> [--dry-run] [--artifact-root artifacts] [--run-id id]
-//                [--hermes-bin path] [--replay-bin path]
+//                [--hermes-bin path] [--replay-bin path] [--runs N]
 //   hermes_bench --generate-baseline [output.yaml]
 //   hermes_bench --generate-active [output.yaml]
+//   hermes_bench --generate-oom-stress [output.yaml]
 
 #include "hermes/runtime/scenario_config.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <iomanip>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -117,6 +115,42 @@ struct HermesExecution {
     bool replay_exit_code_valid{false};
 };
 
+struct MultiRunStats {
+    std::vector<double> fg_latency_ms;   // foreground workload durations across runs
+    std::size_t total_oom_kills{0};      // workloads killed with SIGKILL (exit 137)
+    std::size_t total_runs{0};
+    std::size_t total_launched{0};
+    std::size_t total_completed{0};
+
+    void record_run(const std::vector<WorkloadExecution>& executions) {
+        ++total_runs;
+        for (const WorkloadExecution& e : executions) {
+            if (!e.launch_ok) continue;
+            ++total_launched;
+            const uint64_t dur = (e.child.end_ts_wall > e.child.start_ts_wall)
+                ? e.child.end_ts_wall - e.child.start_ts_wall : 0u;
+            if (e.workload.foreground) {
+                fg_latency_ms.push_back(static_cast<double>(dur));
+            }
+            if (e.child.exit_code_valid && e.child.exit_code == 0 && !e.timed_out) {
+                ++total_completed;
+            }
+            // exit code 137 = SIGKILL, typically OOM kill on Linux
+            if (e.child.exit_code_valid && e.child.exit_code == 137) {
+                ++total_oom_kills;
+            }
+        }
+    }
+
+    double percentile(double pct) const {
+        if (fg_latency_ms.empty()) return 0.0;
+        std::vector<double> sorted = fg_latency_ms;
+        std::sort(sorted.begin(), sorted.end());
+        const std::size_t idx = static_cast<std::size_t>(pct / 100.0 * (sorted.size() - 1));
+        return sorted[std::min(idx, sorted.size() - 1)];
+    }
+};
+
 struct ReplaySummarySnapshot {
     bool available{false};
     bool valid{false};
@@ -156,7 +190,115 @@ bool option_value(const std::vector<std::string>& args, const std::string& optio
 
 bool is_option_with_value(const std::string& arg) {
     return arg == "--artifact-root" || arg == "--run-id" ||
-           arg == "--hermes-bin" || arg == "--replay-bin";
+           arg == "--hermes-bin" || arg == "--replay-bin" || arg == "--runs" ||
+           arg == "--compare-bin" || arg == "--delta-vs";
+}
+
+// ---------------------------------------------------------------------------
+// --delta-vs helpers: load a summary JSON field and print a delta table.
+// ---------------------------------------------------------------------------
+
+double extract_json_double(const std::string& content, const std::string& key,
+                           double fallback = -1.0) {
+    const std::string search = "\"" + key + "\":";
+    const auto pos = content.find(search);
+    if (pos == std::string::npos) return fallback;
+    const auto start = pos + search.size();
+    // Skip whitespace
+    const auto val_start = content.find_first_not_of(" \t", start);
+    if (val_start == std::string::npos) return fallback;
+    if (content[val_start] == 'n') return fallback; // null
+    try { return std::stod(content.substr(val_start)); } catch (...) { return fallback; }
+}
+
+struct SummarySnapshot {
+    bool loaded{false};
+    double p95_latency_ms{-1.0};
+    double completion_rate{-1.0};
+    double oom_count{-1.0};
+    double intervention_count{-1.0};
+    std::string run_id;
+};
+
+SummarySnapshot load_summary_snapshot(const std::string& path) {
+    SummarySnapshot snap;
+    std::ifstream f(path);
+    if (!f.is_open()) return snap;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    snap.p95_latency_ms    = extract_json_double(content, "p95_latency_ms");
+    snap.completion_rate   = extract_json_double(content, "completion_rate");
+    snap.oom_count         = extract_json_double(content, "oom_count");
+    snap.intervention_count= extract_json_double(content, "intervention_count");
+    // Extract run_id string
+    const std::string rid_search = "\"run_id\":\"";
+    const auto rpos = content.find(rid_search);
+    if (rpos != std::string::npos) {
+        const auto s = rpos + rid_search.size();
+        const auto e = content.find('"', s);
+        if (e != std::string::npos) snap.run_id = content.substr(s, e - s);
+    }
+    snap.loaded = (snap.p95_latency_ms >= 0.0 || snap.completion_rate >= 0.0);
+    return snap;
+}
+
+void print_delta_table(
+    const SummarySnapshot& baseline,
+    const SummarySnapshot& current,
+    const std::string& current_run_id) {
+
+    const std::string sep(64, '=');
+    std::cout << "\n" << sep << "\n";
+    std::cout << "Delta vs Baseline  (current: " << current_run_id
+              << "  baseline: " << baseline.run_id << ")\n";
+    std::cout << sep << "\n";
+
+    struct Row {
+        std::string metric;
+        double base;
+        double curr;
+        bool lower_is_better;
+    };
+    const std::vector<Row> rows = {
+        {"p95_latency_ms",     baseline.p95_latency_ms,     current.p95_latency_ms,     true},
+        {"completion_rate",    baseline.completion_rate,     current.completion_rate,     false},
+        {"oom_count",          baseline.oom_count,           current.oom_count,           true},
+        {"intervention_count", baseline.intervention_count,  current.intervention_count,  true},
+    };
+
+    std::cout << "  " << std::left << std::setw(24) << "Metric"
+              << std::right << std::setw(12) << "Baseline"
+              << std::setw(12) << "Current"
+              << std::setw(12) << "Delta"
+              << "  Verdict\n";
+    std::cout << "  " << std::string(22, '-') << "  "
+              << std::string(10, '-') << "  "
+              << std::string(10, '-') << "  "
+              << std::string(10, '-') << "  -------\n";
+
+    std::cout << std::fixed << std::setprecision(2);
+    for (const auto& row : rows) {
+        if (row.base < 0.0 || row.curr < 0.0) {
+            std::cout << "  " << std::left << std::setw(24) << row.metric
+                      << "  " << std::right << std::setw(10) << "N/A"
+                      << "  " << std::setw(10) << "N/A"
+                      << "  " << std::setw(10) << "N/A"
+                      << "  N/A\n";
+            continue;
+        }
+        const double delta = row.curr - row.base;
+        const bool improved = row.lower_is_better ? (delta < 0.0) : (delta > 0.0);
+        const bool neutral  = delta == 0.0;
+        const std::string verdict = neutral ? "=" : (improved ? "BETTER" : "WORSE");
+        std::string delta_str = (delta >= 0.0 ? "+" : "") + std::to_string(delta).substr(
+            0, std::to_string(delta).find('.') + 3);
+        std::cout << "  " << std::left << std::setw(24) << row.metric
+                  << "  " << std::right << std::setw(10) << row.base
+                  << "  " << std::setw(10) << row.curr
+                  << "  " << std::setw(10) << delta_str
+                  << "  " << verdict << "\n";
+    }
+    std::cout << sep << "\n";
 }
 
 std::string first_positional_arg(const std::vector<std::string>& args) {
@@ -1113,6 +1255,25 @@ bool run_hermes_replay(
     return true;
 }
 
+// Compute p95 completion latency (ms) across foreground workloads in one run.
+// Returns -1.0 when no valid foreground timing is available.
+double compute_fg_p95_ms(const std::vector<WorkloadExecution>& executions) {
+    std::vector<double> durations;
+    for (const WorkloadExecution& e : executions) {
+        if (!e.workload.foreground) continue;
+        if (!e.launch_ok) continue;
+        if (e.child.start_ts_wall == 0 || e.child.end_ts_wall < e.child.start_ts_wall) continue;
+        durations.push_back(static_cast<double>(e.child.end_ts_wall - e.child.start_ts_wall));
+    }
+    if (durations.empty()) return -1.0;
+    std::sort(durations.begin(), durations.end());
+    const double idx   = 0.95 * static_cast<double>(durations.size() - 1);
+    const std::size_t lo = static_cast<std::size_t>(idx);
+    const std::size_t hi = (lo + 1 < durations.size()) ? lo + 1 : lo;
+    const double frac  = idx - static_cast<double>(lo);
+    return durations[lo] * (1.0 - frac) + durations[hi] * frac;
+}
+
 bool write_execution_summary(
     const hermes::BenchmarkScenario& scenario,
     const PlanValidation& validation,
@@ -1124,6 +1285,7 @@ bool write_execution_summary(
     const std::string& run_id,
     const std::filesystem::path& plan_path,
     const std::filesystem::path& scenario_snapshot_path,
+    double p95_latency_ms,         // -1.0 = not measured
     std::filesystem::path& output_path,
     std::string& error) {
     try {
@@ -1139,6 +1301,27 @@ bool write_execution_summary(
     for (const std::string& warning : validation.warnings) {
         notes.push_back("plan warning: " + warning);
     }
+
+    // Derived comparison-friendly fields.
+    const double completion_rate =
+        (summary.launched > 0)
+            ? static_cast<double>(summary.jobs_completed) / static_cast<double>(summary.launched)
+            : 0.0;
+    // intervention_count: number of actions Hermes took this run (from replay snapshot).
+    const uint64_t intervention_count = replay_snapshot.available ? replay_snapshot.actions : 0u;
+    // oom_count: exit code 137 means SIGKILL, the typical Linux OOM-kill signal.
+    uint64_t oom_count_real = 0;
+    for (const WorkloadExecution& e : executions) {
+        if (e.child.exit_code_valid && e.child.exit_code == 137) {
+            ++oom_count_real;
+        }
+    }
+    // degraded_behavior: true when completion rate is below scenario target or nonzero exits occurred.
+    const double min_completion = scenario.expected_min_job_completion_rate > 0.0
+        ? scenario.expected_min_job_completion_rate
+        : 0.8;
+    const bool degraded_behavior =
+        (completion_rate < min_completion) || (summary.exited_nonzero > 0) || (oom_count_real > 0);
 
     std::ofstream out(output_path);
     if (!out.is_open()) {
@@ -1168,6 +1351,20 @@ bool write_execution_summary(
         << "  \"timed_out\": " << summary.timed_out << ",\n"
         << "  \"exited_nonzero\": " << summary.exited_nonzero << ",\n"
         << "  \"still_running\": " << summary.still_running << ",\n"
+        << "  \"completion_rate\": " << completion_rate << ",\n"
+        << "  \"intervention_count\": " << intervention_count << ",\n"
+        << "  \"oom_count\": " << oom_count_real << ",\n"
+        << "  \"degraded_behavior\": " << bool_json(degraded_behavior) << ",\n"
+        << "  \"p95_latency_ms\": "
+        << (p95_latency_ms >= 0.0 ? std::to_string(p95_latency_ms) : "null") << ",\n"
+        << "  \"latency_target_ms\": "
+        << (scenario.expected_max_p95_latency_ms > 0.0
+                ? std::to_string(scenario.expected_max_p95_latency_ms)
+                : "null") << ",\n"
+        << "  \"latency_target_met\": "
+        << (p95_latency_ms >= 0.0 && scenario.expected_max_p95_latency_ms > 0.0
+                ? bool_json(p95_latency_ms <= scenario.expected_max_p95_latency_ms)
+                : "null") << ",\n"
         << "  \"notes\": " << string_array_json(notes) << ",\n"
         << "  \"hermes\": {\n"
         << "    \"requested\": " << bool_json(hermes_execution.requested) << ",\n"
@@ -1307,6 +1504,116 @@ bool write_plan_artifacts(
     return out.good();
 }
 
+bool write_latency_summary(
+    const std::string& artifact_root,
+    const std::string& base_run_id,
+    const MultiRunStats& stats,
+    std::string& error) {
+    if (stats.fg_latency_ms.empty()) return true;
+
+    try {
+        const std::filesystem::path bench_dir = std::filesystem::path(artifact_root) / "bench";
+        std::filesystem::create_directories(bench_dir);
+        const std::filesystem::path out_path = bench_dir / (base_run_id + "-latency.json");
+
+        std::ofstream out(out_path);
+        if (!out.is_open()) {
+            error = "failed to open latency summary: " + out_path.string();
+            return false;
+        }
+
+        out << std::fixed << std::setprecision(2);
+        out << "{\n"
+            << "  \"run_id\": \"" << json_escape(base_run_id) << "\",\n"
+            << "  \"total_runs\": " << stats.total_runs << ",\n"
+            << "  \"fg_latency_samples\": " << stats.fg_latency_ms.size() << ",\n"
+            << "  \"p50_latency_ms\": " << stats.percentile(50.0) << ",\n"
+            << "  \"p95_latency_ms\": " << stats.percentile(95.0) << ",\n"
+            << "  \"p99_latency_ms\": " << stats.percentile(99.0) << ",\n"
+            << "  \"max_latency_ms\": " << stats.percentile(100.0) << ",\n"
+            << "  \"min_latency_ms\": " << stats.percentile(0.0) << ",\n"
+            << "  \"total_launched\": " << stats.total_launched << ",\n"
+            << "  \"total_completed\": " << stats.total_completed << ",\n"
+            << "  \"oom_kills\": " << stats.total_oom_kills << "\n"
+            << "}\n";
+        return out.good();
+    } catch (const std::exception& ex) {
+        error = std::string("latency summary write error: ") + ex.what();
+        return false;
+    }
+}
+
+// Generate an OOM-stress scenario: heavy memory + GPU pressure designed to
+// trigger OOM-kill events when run without Hermes, while active-control mode
+// should keep the foreground inference job alive.
+void generate_oom_stress(const std::string& path) {
+    hermes::BenchmarkScenario s;
+    s.name = "oom-stress-intervention";
+    s.runtime_mode = "active-control";
+    s.warmup_s = 5;
+    s.measurement_s = 60;
+    s.repeat_count = 3;
+    s.ups_critical_threshold = 0.75;
+
+    // Assertions: Hermes should prevent all OOM kills and meet latency target.
+    s.expected_max_oom_count              = 0.0;
+    s.expected_max_p95_latency_ms         = 8000.0;
+    s.expected_min_job_completion_rate    = 0.85;
+
+    // Foreground: latency-sensitive inference server (protected by Hermes).
+    hermes::BenchmarkWorkload inference;
+    inference.name       = "inference_fg";
+    inference.command    = "python -c \""
+        "import time, sys\n"
+        "buf = []\n"
+        "for i in range(20):\n"
+        "    buf.append(bytearray(50 * 1024 * 1024))\n"  // 50 MB chunks → 1 GB total
+        "    time.sleep(0.5)\n"
+        "print('inference done')\"";
+    inference.foreground  = true;
+    inference.duration_s  = 60;
+
+    // Background: memory hog 1 — stress-ng virtual memory.
+    hermes::BenchmarkWorkload mem_hog_a;
+    mem_hog_a.name       = "mem_hog_a";
+    mem_hog_a.command    = "stress-ng --vm 2 --vm-bytes 512M --timeout 60s";
+    mem_hog_a.background = true;
+    mem_hog_a.duration_s = 60;
+
+    // Background: memory hog 2 — Python large allocation.
+    hermes::BenchmarkWorkload mem_hog_b;
+    mem_hog_b.name       = "mem_hog_b";
+    mem_hog_b.command    = "python -c \""
+        "import time\n"
+        "buf = bytearray(800 * 1024 * 1024)\n"  // 800 MB allocation
+        "time.sleep(55)\"";
+    mem_hog_b.background = true;
+    mem_hog_b.duration_s = 60;
+
+    // Background: CPU pressure to elevate PSI scores.
+    hermes::BenchmarkWorkload cpu_stress;
+    cpu_stress.name      = "cpu_pressure";
+    cpu_stress.command   = "stress-ng --cpu 2 --timeout 60s";
+    cpu_stress.background = true;
+    cpu_stress.duration_s = 60;
+
+    s.workloads = {inference, mem_hog_a, mem_hog_b, cpu_stress};
+
+    hermes::ScenarioConfigLoader loader;
+    std::string error;
+    if (loader.save(path, s, error)) {
+        std::cout << "hermes_bench: wrote OOM-stress scenario to " << path << "\n"
+                  << "  Mode          : " << s.runtime_mode << "\n"
+                  << "  Runs          : " << s.repeat_count << "\n"
+                  << "  p95 target    : " << s.expected_max_p95_latency_ms << " ms\n"
+                  << "  OOM target    : " << static_cast<int>(s.expected_max_oom_count)
+                  << " (Hermes must prevent all OOM kills)\n"
+                  << "  Completion min: " << s.expected_min_job_completion_rate << "\n";
+    } else {
+        std::cerr << "hermes_bench: failed to write OOM-stress config: " << error << "\n";
+    }
+}
+
 // Generate a scenario config file at the given path.
 void generate_scenario(const std::string& path, bool active) {
     hermes::ScenarioConfigLoader loader;
@@ -1327,16 +1634,23 @@ int main(int argc, char* argv[]) {
 
     if (args.empty() || has_flag(args, "--help")) {
         std::cout << "Usage: hermes_bench <scenario.yaml> [options]\n"
-                  << "       hermes_bench --generate-baseline [output.yaml]\n"
-                  << "       hermes_bench --generate-active   [output.yaml]\n"
+                  << "       hermes_bench --generate-baseline   [output.yaml]\n"
+                  << "       hermes_bench --generate-active     [output.yaml]\n"
+                  << "       hermes_bench --generate-oom-stress [output.yaml]\n"
                   << "\nOptions:\n"
                   << "  --dry-run           Print plan without launching workloads\n"
                   << "  --artifact-root DIR Artifact root for plan output (default: $HERMES_ARTIFACT_ROOT or artifacts)\n"
-                  << "  --run-id ID         Run id for plan artifacts (default: generated from scenario name)\n"
+                  << "  --run-id ID         Base run id for artifacts (default: generated from scenario name)\n"
+                  << "  --runs N            Repeat the scenario N times (overrides scenario repeat_count)\n"
                   << "  --hermes-bin PATH   Optional hermesd path for observe/advisory/active runs\n"
                   << "  --replay-bin PATH   Optional hermes_replay path for observe/advisory/active runs\n"
-                  << "  --generate-baseline Write a default baseline scenario config\n"
-                  << "  --generate-active   Write a default active-control scenario config\n";
+                  << "  --auto-compare      Run hermes_compare after all runs complete\n"
+                  << "  --compare-bin PATH  Path to hermes_compare binary (default: sibling of this binary)\n"
+                  << "  --verify-targets    Exit non-zero if any run misses latency or OOM assertions\n"
+                  << "  --delta-vs PATH     Compare this run's summary against a saved baseline summary JSON\n"
+                  << "  --generate-baseline   Write a default baseline scenario config\n"
+                  << "  --generate-active     Write a default active-control scenario config\n"
+                  << "  --generate-oom-stress Write a memory/VRAM pressure scenario for OOM-kill intervention testing\n";
         return args.empty() ? 1 : 0;
     }
 
@@ -1349,6 +1663,12 @@ int main(int argc, char* argv[]) {
     if (has_flag(args, "--generate-active")) {
         const std::string path = generation_output_path(args, "--generate-active", "active_scenario.yaml");
         generate_scenario(path, true);
+        return 0;
+    }
+
+    if (has_flag(args, "--generate-oom-stress")) {
+        const std::string path = generation_output_path(args, "--generate-oom-stress", "oom_stress_scenario.yaml");
+        generate_oom_stress(path);
         return 0;
     }
 
@@ -1375,19 +1695,39 @@ int main(int argc, char* argv[]) {
 
     PlanValidation validation = validate_plan(scenario);
 
-    std::string run_id;
-    option_value(args, "--run-id", run_id);
-    if (run_id.empty()) {
-        run_id = default_run_id(scenario);
+    std::string base_run_id;
+    option_value(args, "--run-id", base_run_id);
+    if (base_run_id.empty()) {
+        base_run_id = default_run_id(scenario);
+    }
+
+    // --runs N overrides scenario repeat_count for multi-run execution.
+    int total_runs = scenario.repeat_count;
+    {
+        std::string runs_str;
+        if (option_value(args, "--runs", runs_str)) {
+            try {
+                const int n = std::stoi(runs_str);
+                if (n > 0) {
+                    total_runs = n;
+                }
+            } catch (...) {}
+        }
     }
 
     const std::filesystem::path current_executable =
         argc > 0 ? std::filesystem::path(argv[0]) : std::filesystem::path();
     std::string hermes_bin_override;
     std::string replay_bin_override;
+    std::string compare_bin_override;
+    const bool auto_compare    = has_flag(args, "--auto-compare");
+    const bool verify_targets  = has_flag(args, "--verify-targets");
     option_value(args, "--hermes-bin", hermes_bin_override);
     option_value(args, "--replay-bin", replay_bin_override);
+    option_value(args, "--compare-bin", compare_bin_override);
 
+    // Write a single plan artifact that covers all runs.
+    const std::string plan_run_id = base_run_id + (total_runs > 1 ? "-plan" : "");
     std::filesystem::path plan_path;
     std::filesystem::path scenario_snapshot_path;
     if (!write_plan_artifacts(
@@ -1395,7 +1735,7 @@ int main(int argc, char* argv[]) {
             validation,
             config_path,
             artifact_root,
-            run_id,
+            plan_run_id,
             dry_run,
             plan_path,
             scenario_snapshot_path,
@@ -1404,9 +1744,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "\nPlan run id      : " << run_id
+    std::cout << "\nPlan run id      : " << plan_run_id
               << "\nPlan artifact    : " << plan_path.string()
-              << "\nScenario snapshot: " << scenario_snapshot_path.string() << "\n";
+              << "\nScenario snapshot: " << scenario_snapshot_path.string()
+              << "\nTotal runs       : " << total_runs << "\n";
 
     if (!validation.warnings.empty()) {
         std::cout << "\nPlan warnings:\n";
@@ -1427,108 +1768,270 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    HermesExecution hermes_execution;
-    ReplaySummarySnapshot replay_snapshot;
     bool overall_ok = true;
+    MultiRunStats multi_stats;
 
-    if (runtime_mode_uses_hermes(scenario.runtime_mode)) {
-        hermes_execution.hermes_bin =
-            resolve_binary_path(hermes_bin_override, current_executable, "hermesd");
-        hermes_execution.replay_bin =
-            resolve_binary_path(replay_bin_override, current_executable, "hermes_replay");
+    for (int run_index = 0; run_index < total_runs; ++run_index) {
+        const std::string run_id = (total_runs > 1)
+            ? base_run_id + "-r" + std::to_string(run_index + 1)
+            : base_run_id;
 
-        if (!start_hermes_execution(
+        if (total_runs > 1) {
+            std::cout << "\n--- Run " << (run_index + 1) << "/" << total_runs
+                      << " (" << run_id << ") ---\n";
+        }
+
+        HermesExecution hermes_execution;
+        ReplaySummarySnapshot replay_snapshot;
+
+        if (runtime_mode_uses_hermes(scenario.runtime_mode)) {
+            hermes_execution.hermes_bin =
+                resolve_binary_path(hermes_bin_override, current_executable, "hermesd");
+            hermes_execution.replay_bin =
+                resolve_binary_path(replay_bin_override, current_executable, "hermes_replay");
+
+            if (!start_hermes_execution(
+                    scenario,
+                    artifact_root,
+                    run_id,
+                    hermes_execution.hermes_bin,
+                    hermes_execution,
+                    error)) {
+                std::cerr << "hermes_bench: failed to launch Hermes daemon: " << error << std::endl;
+                overall_ok = false;
+                continue;
+            }
+
+            std::cout << "Hermes binary    : " << hermes_execution.hermes_bin
+                      << "\nReplay binary    : " << hermes_execution.replay_bin
+                      << "\nHermes run id    : " << hermes_execution.run_id
+                      << "\nHermes run dir   : " << hermes_execution.run_directory << "\n";
+        } else {
+            std::cout << "Hermes runtime   : disabled for baseline mode\n";
+        }
+
+        std::vector<WorkloadExecution> executions;
+        executions.reserve(scenario.workloads.size());
+        for (const hermes::BenchmarkWorkload& workload : scenario.workloads) {
+            WorkloadExecution execution;
+            execution.workload = workload;
+            executions.push_back(execution);
+        }
+
+        ExecutionSummary summary = execute_benchmark(scenario, executions);
+        multi_stats.record_run(executions);
+
+        if (hermes_execution.launch_ok) {
+            std::string hermes_wait_error;
+            if (!wait_for_child_process(hermes_execution.child, 4000, hermes_wait_error)) {
+                if (hermes_execution.child.running) {
+                    stop_child_process(hermes_execution.child);
+                    summary.notes.push_back("Hermes daemon exceeded shutdown wait and was terminated");
+                } else {
+                    summary.notes.push_back("Hermes daemon wait error: " + hermes_wait_error);
+                }
+                overall_ok = false;
+            }
+
+            if (hermes_execution.child.exit_code_valid && hermes_execution.child.exit_code != 0) {
+                summary.notes.push_back(
+                    "Hermes daemon exited with code " +
+                    std::to_string(hermes_execution.child.exit_code));
+                overall_ok = false;
+            }
+
+            if (!run_hermes_replay(hermes_execution, artifact_root, replay_snapshot, error)) {
+                summary.notes.push_back("Hermes replay failed: " + error);
+                overall_ok = false;
+            }
+        }
+
+        std::filesystem::path summary_path;
+        if (!write_execution_summary(
                 scenario,
+                validation,
+                summary,
+                executions,
+                hermes_execution,
+                replay_snapshot,
                 artifact_root,
                 run_id,
-                hermes_execution.hermes_bin,
-                hermes_execution,
+                plan_path,
+                scenario_snapshot_path,
+                compute_fg_p95_ms(executions),
+                summary_path,
                 error)) {
-            std::cerr << "hermes_bench: failed to launch Hermes daemon: " << error << std::endl;
+            std::cerr << "hermes_bench: failed to write execution summary: " << error << std::endl;
+            overall_ok = false;
+            continue;
+        }
+
+        std::cout << "\nRun summary      : " << summary_path.string()
+                  << "\nLaunched         : " << summary.launched
+                  << "\nLaunch failed    : " << summary.launch_failed
+                  << "\nJobs completed   : " << summary.jobs_completed
+                  << "\nTimed out        : " << summary.timed_out
+                  << "\nExited nonzero   : " << summary.exited_nonzero
+                  << "\nRun duration ms  : " << summary.duration_ms;
+
+        if (hermes_execution.requested) {
+            std::cout << "\nHermes exit code : "
+                      << (hermes_execution.child.exit_code_valid
+                              ? std::to_string(hermes_execution.child.exit_code)
+                              : "n/a")
+                      << "\nReplay summary   : " << hermes_execution.replay_summary_path.string()
+                      << "\nReplay valid     : " << (replay_snapshot.valid ? "true" : "false")
+                      << "\nReplay samples   : " << replay_snapshot.samples
+                      << "\nReplay decisions : " << replay_snapshot.decisions
+                      << "\nReplay actions   : " << replay_snapshot.actions;
+        }
+        std::cout << "\n";
+    }
+
+    // Auto-compare: invoke hermes_compare on the bench directory after all runs.
+    if (auto_compare) {
+        const std::string compare_bin =
+            resolve_binary_path(compare_bin_override, current_executable, "hermes_compare");
+        const std::filesystem::path bench_dir =
+            std::filesystem::path(artifact_root) / "bench";
+        const std::filesystem::path compare_csv =
+            bench_dir / (base_run_id + "-auto-comparison.csv");
+
+        std::cout << "\n--- hermes_compare (auto) ---\n";
+        std::string compare_error;
+        bool compare_timed_out = false;
+        int compare_exit = 0;
+        const bool compare_ok = run_program_sync(
+            compare_bin,
+            {"--bench-dir", bench_dir.string(),
+             "--output-csv", compare_csv.string()},
+            30000,
+            compare_exit,
+            compare_timed_out,
+            compare_error);
+
+        if (!compare_ok) {
+            std::cerr << "hermes_bench: hermes_compare failed"
+                      << (compare_timed_out ? " (timed out)" : "")
+                      << ": " << compare_error << "\n";
+        } else {
+            std::cout << "Comparison CSV   : " << compare_csv.string() << "\n";
+        }
+    }
+
+    // Write multi-run latency summary if more than one run or any foreground data collected.
+    if (!multi_stats.fg_latency_ms.empty()) {
+        std::string lat_error;
+        if (write_latency_summary(artifact_root, base_run_id, multi_stats, lat_error)) {
+            std::cout << "\nLatency summary  : "
+                      << (std::filesystem::path(artifact_root) / "bench" / (base_run_id + "-latency.json")).string()
+                      << "\np50 fg latency   : " << std::fixed << std::setprecision(0)
+                      << multi_stats.percentile(50.0) << " ms"
+                      << "\np95 fg latency   : " << multi_stats.percentile(95.0) << " ms"
+                      << "\nOOM kills total  : " << multi_stats.total_oom_kills << "\n";
+        } else {
+            std::cerr << "hermes_bench: failed to write latency summary: " << lat_error << "\n";
+        }
+    }
+
+    // --delta-vs: compare this run's summary against a saved baseline summary.
+    {
+        std::string delta_vs_path;
+        if (option_value(args, "--delta-vs", delta_vs_path)) {
+            // Load baseline from the provided path.
+            const SummarySnapshot baseline = load_summary_snapshot(delta_vs_path);
+            if (!baseline.loaded) {
+                std::cerr << "hermes_bench: --delta-vs: could not load summary from "
+                          << delta_vs_path << "\n";
+            } else {
+                // Find the most recently written summary for this run.
+                const std::string last_run_id = (total_runs > 1)
+                    ? base_run_id + "-r" + std::to_string(total_runs)
+                    : base_run_id;
+                const std::filesystem::path summary_path =
+                    std::filesystem::path(artifact_root) / "bench"
+                    / (last_run_id + "-summary.json");
+                const SummarySnapshot current = load_summary_snapshot(summary_path.string());
+                if (!current.loaded) {
+                    // Fall back to latency summary if per-run summary not found.
+                    const std::filesystem::path lat_path =
+                        std::filesystem::path(artifact_root) / "bench"
+                        / (base_run_id + "-latency.json");
+                    const SummarySnapshot lat_snap = load_summary_snapshot(lat_path.string());
+                    if (lat_snap.loaded) {
+                        print_delta_table(baseline, lat_snap, base_run_id + " (latency)");
+                    } else {
+                        std::cerr << "hermes_bench: --delta-vs: current run summary not found at "
+                                  << summary_path.string() << "\n";
+                    }
+                } else {
+                    print_delta_table(baseline, current, last_run_id);
+                }
+            }
+        }
+    }
+
+    // --verify-targets: check every summary in artifacts/bench/ against scenario assertions.
+    if (verify_targets) {
+        bool targets_ok = true;
+        const std::filesystem::path bench_dir =
+            std::filesystem::path(artifact_root) / "bench";
+
+        if (std::filesystem::exists(bench_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(bench_dir)) {
+                const std::string fname = entry.path().filename().string();
+                if (fname.size() <= 13 || fname.substr(fname.size() - 13) != "-summary.json")
+                    continue;
+
+                std::ifstream f(entry.path());
+                if (!f.is_open()) continue;
+                std::string content((std::istreambuf_iterator<char>(f)),
+                                     std::istreambuf_iterator<char>());
+
+                // Check latency_target_met (must be true or null/absent when no target set).
+                const auto met_pos = content.find("\"latency_target_met\":");
+                if (met_pos != std::string::npos) {
+                    const auto val_start = content.find_first_not_of(" ", met_pos + 21);
+                    if (val_start != std::string::npos &&
+                        content.substr(val_start, 5) == "false") {
+                        const auto rid_pos = content.find("\"run_id\":\"");
+                        std::string rid = fname;
+                        if (rid_pos != std::string::npos) {
+                            const auto s = rid_pos + 10;
+                            const auto e = content.find('"', s);
+                            if (e != std::string::npos) rid = content.substr(s, e - s);
+                        }
+                        std::cerr << "hermes_bench: [FAIL target] " << rid
+                                  << " — latency_target_met=false\n";
+                        targets_ok = false;
+                    }
+                }
+
+                // Check oom_count against expected_max_oom_count (0 = must have 0 kills).
+                if (scenario.expected_max_oom_count >= 0.0) {
+                    const auto oom_pos = content.find("\"oom_count\":");
+                    if (oom_pos != std::string::npos) {
+                        const auto vs = oom_pos + 12;
+                        uint64_t oom_count = 0;
+                        try { oom_count = std::stoull(content.substr(vs)); } catch (...) {}
+                        if (static_cast<double>(oom_count) > scenario.expected_max_oom_count) {
+                            std::cerr << "hermes_bench: [FAIL target] " << fname
+                                      << " — oom_count=" << oom_count
+                                      << " exceeds expected_max=" << scenario.expected_max_oom_count << "\n";
+                            targets_ok = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (targets_ok) {
+            std::cout << "\nTarget verification: PASS (all latency and OOM assertions met)\n";
+        } else {
+            std::cout << "\nTarget verification: FAIL (see errors above)\n";
             return 1;
         }
-
-        std::cout << "Hermes binary    : " << hermes_execution.hermes_bin
-                  << "\nReplay binary    : " << hermes_execution.replay_bin
-                  << "\nHermes run id    : " << hermes_execution.run_id
-                  << "\nHermes run dir   : " << hermes_execution.run_directory << "\n";
-    } else {
-        std::cout << "Hermes runtime   : disabled for baseline mode\n";
     }
-
-    std::vector<WorkloadExecution> executions;
-    executions.reserve(scenario.workloads.size());
-    for (const hermes::BenchmarkWorkload& workload : scenario.workloads) {
-        WorkloadExecution execution;
-        execution.workload = workload;
-        executions.push_back(execution);
-    }
-
-    ExecutionSummary summary = execute_benchmark(scenario, executions);
-
-    if (hermes_execution.launch_ok) {
-        std::string hermes_wait_error;
-        if (!wait_for_child_process(hermes_execution.child, 4000, hermes_wait_error)) {
-            if (hermes_execution.child.running) {
-                stop_child_process(hermes_execution.child);
-                summary.notes.push_back("Hermes daemon exceeded shutdown wait and was terminated");
-            } else {
-                summary.notes.push_back("Hermes daemon wait error: " + hermes_wait_error);
-            }
-            overall_ok = false;
-        }
-
-        if (hermes_execution.child.exit_code_valid && hermes_execution.child.exit_code != 0) {
-            summary.notes.push_back(
-                "Hermes daemon exited with code " +
-                std::to_string(hermes_execution.child.exit_code));
-            overall_ok = false;
-        }
-
-        if (!run_hermes_replay(hermes_execution, artifact_root, replay_snapshot, error)) {
-            summary.notes.push_back("Hermes replay failed: " + error);
-            overall_ok = false;
-        }
-    }
-
-    std::filesystem::path summary_path;
-    if (!write_execution_summary(
-            scenario,
-            validation,
-            summary,
-            executions,
-            hermes_execution,
-            replay_snapshot,
-            artifact_root,
-            run_id,
-            plan_path,
-            scenario_snapshot_path,
-            summary_path,
-            error)) {
-        std::cerr << "hermes_bench: failed to write execution summary: " << error << std::endl;
-        return 1;
-    }
-
-    std::cout << "\nRun summary      : " << summary_path.string()
-              << "\nLaunched         : " << summary.launched
-              << "\nLaunch failed    : " << summary.launch_failed
-              << "\nJobs completed   : " << summary.jobs_completed
-              << "\nTimed out        : " << summary.timed_out
-              << "\nExited nonzero   : " << summary.exited_nonzero
-              << "\nRun duration ms  : " << summary.duration_ms;
-
-    if (hermes_execution.requested) {
-        std::cout << "\nHermes exit code : "
-                  << (hermes_execution.child.exit_code_valid
-                          ? std::to_string(hermes_execution.child.exit_code)
-                          : "n/a")
-                  << "\nReplay summary   : " << hermes_execution.replay_summary_path.string()
-                  << "\nReplay valid     : " << (replay_snapshot.valid ? "true" : "false")
-                  << "\nReplay samples   : " << replay_snapshot.samples
-                  << "\nReplay decisions : " << replay_snapshot.decisions
-                  << "\nReplay actions   : " << replay_snapshot.actions;
-    }
-    std::cout << "\n";
 
     return overall_ok ? 0 : 1;
 }

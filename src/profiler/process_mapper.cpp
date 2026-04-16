@@ -1,4 +1,5 @@
 #include "hermes/profiler/process_mapper.hpp"
+#include "hermes/monitor/nvml_backend.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -17,6 +18,11 @@ bool is_numeric_directory(const std::string& name) {
     return !name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char ch) {
         return std::isdigit(ch) != 0;
     });
+}
+
+NvmlBackend& nvml_instance() {
+    static NvmlBackend instance;
+    return instance;
 }
 
 } // namespace
@@ -62,9 +68,28 @@ std::vector<ProcessSnapshot> ProcessMapper::collect(const std::vector<GpuProcess
         return {};
     }
 
+    // Build gpu_by_pid: prefer NVML direct query; fall back to passed nvidia-smi data.
     std::unordered_map<int, double> gpu_by_pid;
-    for (const GpuProcessUsage& usage : gpu_processes) {
-        gpu_by_pid[usage.pid] += usage.gpu_mb;
+    bool used_nvml = false;
+    NvmlBackend& nvml = nvml_instance();
+    if (nvml.available() && nvml.device_count() > 0) {
+        std::vector<GpuProcessStats> nvml_procs;
+        const bool ok = nvml.device_count() > 1
+            ? nvml.query_all_processes(nvml_procs)
+            : nvml.query_processes(0, nvml_procs);
+        if (ok) {
+            constexpr double kBytesPerMb = 1048576.0;
+            for (const auto& p : nvml_procs) {
+                gpu_by_pid[static_cast<int>(p.pid)] +=
+                    static_cast<double>(p.used_gpu_memory_bytes) / kBytesPerMb;
+            }
+            used_nvml = true;
+        }
+    }
+    if (!used_nvml) {
+        for (const GpuProcessUsage& usage : gpu_processes) {
+            gpu_by_pid[usage.pid] += usage.gpu_mb;
+        }
     }
 
     const auto now = std::chrono::steady_clock::now();

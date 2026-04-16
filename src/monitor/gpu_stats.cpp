@@ -1,4 +1,5 @@
 #include "hermes/monitor/gpu_stats.hpp"
+#include "hermes/monitor/nvml_backend.hpp"
 
 #include <array>
 #include <cstdio>
@@ -10,6 +11,16 @@
 #endif
 
 namespace hermes {
+namespace {
+
+// Lazily initialised once per process.  dlopen/nvmlInit are expensive;
+// keeping the handle open amortises cost over repeated sampling calls.
+NvmlBackend& nvml() {
+    static NvmlBackend instance;
+    return instance;
+}
+
+} // namespace
 namespace {
 
 std::string trim(const std::string& value) {
@@ -73,6 +84,12 @@ bool GpuStatsCollector::run_command(const std::string& command, std::string& out
 }
 
 bool GpuStatsCollector::update_sample(PressureSample& sample) {
+    // Fast path: direct NVML query (no subprocess, sub-millisecond latency).
+    if (nvml().available() && nvml().fill_sample(sample)) {
+        return true;
+    }
+
+    // Slow path: nvidia-smi subprocess fallback.
     const std::string command =
         "nvidia-smi --query-gpu=memory.used,memory.total,memory.free,utilization.gpu --format=csv,noheader,nounits";
 
@@ -119,6 +136,24 @@ bool GpuStatsCollector::update_sample(PressureSample& sample) {
 }
 
 std::vector<GpuProcessUsage> GpuStatsCollector::query_process_usage() {
+    // Fast path: NVML direct query.
+    if (nvml().available() && nvml().device_count() > 0) {
+        std::vector<GpuProcessStats> procs;
+        if (nvml().query_processes(0, procs)) {
+            std::vector<GpuProcessUsage> usages;
+            usages.reserve(procs.size());
+            constexpr double kBytesPerMb = 1048576.0;
+            for (const auto& p : procs) {
+                GpuProcessUsage u;
+                u.pid    = static_cast<int>(p.pid);
+                u.gpu_mb = static_cast<double>(p.used_gpu_memory_bytes) / kBytesPerMb;
+                usages.push_back(u);
+            }
+            return usages;
+        }
+    }
+
+    // Slow path: nvidia-smi subprocess fallback.
     const std::string command =
         "nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits";
 

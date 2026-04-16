@@ -141,31 +141,19 @@ std::vector<hermes::ProcessSnapshot> make_processes(double background_gpu_mb, do
     };
 }
 
-std::vector<hermes::PressureSample> make_samples() {
+struct SynthFrame {
+    double cpu_some;
+    double cpu_full;
+    double mem_some;
+    double mem_full;
+    double gpu_util;
+    double vram_used;
+    double vram_free;
+};
+
+std::vector<hermes::PressureSample> frames_to_samples(const std::vector<SynthFrame>& frames) {
     const uint64_t base_wall = wall_now_ms();
     const uint64_t base_mono = mono_now_ms();
-
-    struct Frame {
-        double cpu_some;
-        double cpu_full;
-        double mem_some;
-        double mem_full;
-        double gpu_util;
-        double vram_used;
-        double vram_free;
-    };
-
-    const std::vector<Frame> frames = {
-        {2.0, 0.0, 1.0, 0.0, 12.0, 1200.0, 8800.0},
-        {8.0, 0.5, 6.0, 1.0, 45.0, 5000.0, 5000.0},
-        {20.0, 1.0, 14.0, 3.0, 95.0, 8000.0, 2000.0},
-        {22.0, 2.0, 22.0, 6.0, 96.0, 9700.0, 300.0},
-        {20.0, 1.5, 18.0, 5.0, 90.0, 9750.0, 250.0},
-        {4.0, 0.0, 3.0, 0.2, 24.0, 4200.0, 5800.0},
-        {2.0, 0.0, 1.0, 0.0, 10.0, 1800.0, 8200.0},
-        {1.0, 0.0, 0.5, 0.0, 5.0, 1000.0, 9000.0},
-    };
-
     std::vector<hermes::PressureSample> samples;
     samples.reserve(frames.size());
     for (std::size_t index = 0; index < frames.size(); ++index) {
@@ -184,6 +172,54 @@ std::vector<hermes::PressureSample> make_samples() {
         samples.push_back(sample);
     }
     return samples;
+}
+
+// Default fixture: exercises elevated → throttled → cooldown → recovery.
+std::vector<hermes::PressureSample> make_samples() {
+    return frames_to_samples({
+        {2.0, 0.0, 1.0, 0.0, 12.0, 1200.0, 8800.0},
+        {8.0, 0.5, 6.0, 1.0, 45.0, 5000.0, 5000.0},
+        {20.0, 1.0, 14.0, 3.0, 95.0, 8000.0, 2000.0},
+        {22.0, 2.0, 22.0, 6.0, 96.0, 9700.0, 300.0},
+        {20.0, 1.5, 18.0, 5.0, 90.0, 9750.0, 250.0},
+        {4.0, 0.0, 3.0, 0.2, 24.0, 4200.0, 5800.0},
+        {2.0, 0.0, 1.0, 0.0, 10.0, 1800.0, 8200.0},
+        {1.0, 0.0, 0.5, 0.0, 5.0, 1000.0, 9000.0},
+    });
+}
+
+// Cooldown preset: moderate pressure ramp → sustained elevated → sudden drop → held low.
+// Emphasises the cooldown → idle transition without hitting terminate_candidate.
+std::vector<hermes::PressureSample> make_cooldown_samples() {
+    return frames_to_samples({
+        {3.0, 0.0, 2.0, 0.0, 15.0, 1500.0, 8500.0},
+        {12.0, 0.5, 8.0, 1.0, 50.0, 5200.0, 4800.0},
+        {18.0, 1.0, 12.0, 2.0, 72.0, 7200.0, 2800.0},
+        {20.0, 1.5, 15.0, 3.5, 80.0, 8100.0, 1900.0},
+        {18.0, 1.0, 13.0, 3.0, 76.0, 7800.0, 2200.0},
+        {6.0, 0.0, 4.0, 0.3, 28.0, 3000.0, 7000.0},
+        {3.0, 0.0, 2.0, 0.1, 14.0, 1800.0, 8200.0},
+        {2.0, 0.0, 1.0, 0.0, 8.0, 1200.0, 8800.0},
+        {1.5, 0.0, 0.8, 0.0, 6.0, 1100.0, 8900.0},
+        {1.0, 0.0, 0.5, 0.0, 5.0, 1000.0, 9000.0},
+    });
+}
+
+// Recovery preset: starts at peak pressure, then drops sharply and stays stable.
+// Emphasises the recovery state without retriggering elevated/throttled.
+std::vector<hermes::PressureSample> make_recovery_samples() {
+    return frames_to_samples({
+        {22.0, 2.0, 20.0, 5.0, 95.0, 9600.0, 400.0},
+        {20.0, 1.5, 18.0, 4.5, 92.0, 9500.0, 500.0},
+        {15.0, 1.0, 12.0, 3.0, 78.0, 8200.0, 1800.0},
+        {8.0, 0.5, 6.0, 1.5, 42.0, 5400.0, 4600.0},
+        {4.0, 0.0, 3.0, 0.5, 22.0, 3000.0, 7000.0},
+        {2.5, 0.0, 1.5, 0.1, 12.0, 1800.0, 8200.0},
+        {1.5, 0.0, 1.0, 0.0, 8.0, 1400.0, 8600.0},
+        {1.2, 0.0, 0.8, 0.0, 6.0, 1200.0, 8800.0},
+        {1.0, 0.0, 0.5, 0.0, 5.0, 1000.0, 9000.0},
+        {1.0, 0.0, 0.5, 0.0, 5.0, 1000.0, 9000.0},
+    });
 }
 
 bool write_manifest(
@@ -213,7 +249,11 @@ bool write_manifest(
 }
 
 void print_usage() {
-    std::cout << "Usage: hermes_synth [run-id] [artifact-root]\n"
+    std::cout << "Usage: hermes_synth [options] [run-id] [artifact-root]\n"
+              << "\n"
+              << "Options:\n"
+              << "  --recovery   Use recovery-focused sample sequence (high pressure → sharp drop → stable)\n"
+              << "  --cooldown   Use cooldown-focused sample sequence (moderate ramp → sustained → drop)\n"
               << "\n"
               << "Generates a deterministic synthetic Hermes pressure run under artifacts/logs/.\n"
               << "Environment overrides: HERMES_RUN_ID, HERMES_ARTIFACT_ROOT, HERMES_CONFIG_PATH, HERMES_CONFIG_HASH.\n";
@@ -222,18 +262,35 @@ void print_usage() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
-        print_usage();
-        return 0;
+    bool preset_recovery = false;
+    bool preset_cooldown = false;
+    std::vector<std::string> pos_args;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--help" || arg == "-h") {
+            print_usage();
+            return 0;
+        } else if (arg == "--recovery") {
+            preset_recovery = true;
+        } else if (arg == "--cooldown") {
+            preset_cooldown = true;
+        } else {
+            pos_args.push_back(arg);
+        }
     }
 
-    const std::filesystem::path artifact_root = argc >= 3
-        ? std::filesystem::path(argv[2])
+    const std::filesystem::path artifact_root = pos_args.size() >= 2
+        ? std::filesystem::path(pos_args[1])
         : std::filesystem::path(env_or("HERMES_ARTIFACT_ROOT", "artifacts"));
-    const std::string run_id = argc >= 2
-        ? std::string(argv[1])
+    const std::string run_id = !pos_args.empty()
+        ? pos_args[0]
         : env_or("HERMES_RUN_ID", make_run_id());
-    const std::string scenario = env_or("HERMES_SCENARIO", "synthetic-pressure");
+
+    std::string default_scenario = "synthetic-pressure";
+    if (preset_recovery) { default_scenario = "synthetic-recovery"; }
+    if (preset_cooldown) { default_scenario = "synthetic-cooldown"; }
+    const std::string scenario = env_or("HERMES_SCENARIO", default_scenario);
     const std::string config_path = env_or("HERMES_CONFIG_PATH", "config/schema.yaml");
     const std::string config_hash = env_or("HERMES_CONFIG_HASH", default_config_hash(config_path));
 
@@ -272,7 +329,10 @@ int main(int argc, char** argv) {
         std::cerr << "Metadata warning: " << error << std::endl;
     }
 
-    const std::vector<hermes::PressureSample> samples = make_samples();
+    const std::vector<hermes::PressureSample> samples =
+        preset_recovery ? make_recovery_samples() :
+        preset_cooldown ? make_cooldown_samples() :
+        make_samples();
     if (!write_manifest(event_logger.run_directory(), run_id, scenario, config_hash, samples.size(), error)) {
         event_logger.log_event(
             "scenario_manifest_error",

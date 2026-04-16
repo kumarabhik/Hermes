@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -137,8 +138,12 @@ struct EvalResult {
     double recall{0.0};
     double f1{0.0};
     double mean_lead_time_s{0.0};
+    double false_positive_rate_per_hour{0.0};
+    int total_predictions{0};
     int total_high_risk_predictions{0};
     int total_failure_events{0};
+    bool data_available{false};
+    double observation_window_s{0.0};
 };
 
 EvalResult evaluate(
@@ -147,7 +152,20 @@ EvalResult evaluate(
     double match_window_s) {
 
     EvalResult result;
+    result.total_predictions = static_cast<int>(predictions.size());
+    result.data_available    = !predictions.empty();
     const uint64_t window_ms = static_cast<uint64_t>(match_window_s * 1000.0);
+
+    // Compute observation window from first to last prediction timestamp.
+    if (!predictions.empty()) {
+        const auto [min_it, max_it] = std::minmax_element(
+            predictions.begin(), predictions.end(),
+            [](const PredictionRecord& a, const PredictionRecord& b) {
+                return a.ts_mono < b.ts_mono;
+            });
+        const double span_ms = static_cast<double>(max_it->ts_mono - min_it->ts_mono);
+        result.observation_window_s = span_ms / 1000.0;
+    }
 
     // Collect failure event timestamps
     std::vector<uint64_t> failure_ts;
@@ -207,6 +225,14 @@ EvalResult evaluate(
         result.f1 = 2.0 * result.precision * result.recall / (result.precision + result.recall);
     }
 
+    // false_positive_rate_per_hour = FP / observation_hours
+    // This measures how often Hermes fires a false alarm per hour of operation.
+    if (result.observation_window_s > 0.0) {
+        const double obs_hours = result.observation_window_s / 3600.0;
+        result.false_positive_rate_per_hour =
+            static_cast<double>(result.false_positives) / obs_hours;
+    }
+
     return result;
 }
 
@@ -235,9 +261,17 @@ void write_eval_summary(
         return;
     }
 
+    const uint64_t ts_wall = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    out << std::fixed << std::setprecision(4);
     out << "{\n"
         << "  \"run_directory\": \"" << json_escape(run_dir) << "\",\n"
+        << "  \"ts_wall\": " << ts_wall << ",\n"
         << "  \"match_window_s\": " << match_window_s << ",\n"
+        << "  \"data_available\": " << (result.data_available ? "true" : "false") << ",\n"
+        << "  \"total_predictions\": " << result.total_predictions << ",\n"
         << "  \"total_high_risk_predictions\": " << result.total_high_risk_predictions << ",\n"
         << "  \"total_failure_events\": " << result.total_failure_events << ",\n"
         << "  \"true_positives\": " << result.true_positives << ",\n"
@@ -246,33 +280,51 @@ void write_eval_summary(
         << "  \"precision\": " << result.precision << ",\n"
         << "  \"recall\": " << result.recall << ",\n"
         << "  \"f1\": " << result.f1 << ",\n"
-        << "  \"mean_lead_time_s\": " << result.mean_lead_time_s << "\n"
+        << "  \"mean_lead_time_s\": " << result.mean_lead_time_s << ",\n"
+        << "  \"observation_window_s\": " << result.observation_window_s << ",\n"
+        << "  \"false_positive_rate_per_hour\": " << result.false_positive_rate_per_hour << "\n"
         << "}\n";
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: hermes_eval <run_directory> [match_window_s]\n"
+    if (argc < 2 || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        std::cerr << "Usage: hermes_eval <run_directory> [match_window_s] [--out path]\n"
                   << "  run_directory   Path to a hermesd run artifact directory.\n"
-                  << "  match_window_s  Seconds within which a failure must follow a prediction (default: 10)\n";
-        return 1;
+                  << "  match_window_s  Seconds within which a failure must follow a prediction (default: 10)\n"
+                  << "  --out <path>    Output path for eval_summary.json (default: <run_directory>/eval_summary.json)\n";
+        return argc < 2 ? 1 : 0;
     }
 
     const std::string run_dir = argv[1];
-    const double match_window_s = (argc >= 3) ? std::stod(argv[2]) : 10.0;
+    double match_window_s = 10.0;
+    std::string output_path = run_dir + "/eval_summary.json";
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--out" && i + 1 < argc) {
+            output_path = argv[++i];
+        } else {
+            try { match_window_s = std::stod(arg); } catch (...) {}
+        }
+    }
 
     const std::string predictions_path = run_dir + "/predictions.ndjson";
     const std::string events_path = run_dir + "/events.ndjson";
-    const std::string output_path = run_dir + "/eval_summary.json";
 
     const auto predictions = read_predictions(predictions_path);
     const auto events = read_events(events_path);
 
     if (predictions.empty()) {
-        std::cerr << "hermes_eval: no prediction records found in " << predictions_path << std::endl;
-        return 1;
+        std::cerr << "hermes_eval: no prediction records found in " << predictions_path
+                  << " — writing empty eval_summary.json\n";
+        // Write a well-formed no-data summary rather than failing hard, so
+        // downstream scripts (collect_wsl2_evidence.sh) can still read the file.
+        EvalResult empty;
+        write_eval_summary(output_path, run_dir, empty, match_window_s);
+        std::cout << "hermes_eval: wrote (no-data) " << output_path << std::endl;
+        return 0;
     }
 
     std::cout << "hermes_eval: loaded " << predictions.size() << " predictions, "
@@ -280,15 +332,19 @@ int main(int argc, char* argv[]) {
 
     const EvalResult result = evaluate(predictions, events, match_window_s);
 
-    std::cout << "  high-risk predictions : " << result.total_high_risk_predictions << "\n"
-              << "  failure events        : " << result.total_failure_events << "\n"
-              << "  true positives  (TP)  : " << result.true_positives << "\n"
-              << "  false positives (FP)  : " << result.false_positives << "\n"
-              << "  false negatives (FN)  : " << result.false_negatives << "\n"
-              << "  precision             : " << result.precision << "\n"
-              << "  recall                : " << result.recall << "\n"
-              << "  F1                    : " << result.f1 << "\n"
-              << "  mean lead time (s)    : " << result.mean_lead_time_s << "\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "  total predictions          : " << result.total_predictions << "\n"
+              << "  high-risk predictions      : " << result.total_high_risk_predictions << "\n"
+              << "  failure events             : " << result.total_failure_events << "\n"
+              << "  true positives  (TP)       : " << result.true_positives << "\n"
+              << "  false positives (FP)       : " << result.false_positives << "\n"
+              << "  false negatives (FN)       : " << result.false_negatives << "\n"
+              << "  precision                  : " << result.precision << "\n"
+              << "  recall                     : " << result.recall << "\n"
+              << "  F1                         : " << result.f1 << "\n"
+              << "  mean lead time (s)         : " << result.mean_lead_time_s << "\n"
+              << "  observation window (s)     : " << result.observation_window_s << "\n"
+              << "  false positive rate (/hr)  : " << result.false_positive_rate_per_hour << "\n";
 
     write_eval_summary(output_path, run_dir, result, match_window_s);
     std::cout << "hermes_eval: wrote " << output_path << std::endl;

@@ -1,0 +1,51 @@
+# Hermes low-pressure scenario — used to measure the FALSE POSITIVE RATE.
+#
+# Runs the same foreground workload as baseline but with NO memory or CPU
+# stress alongside it, so the host stays lightly loaded (UPS should remain
+# below 30 for the entire run).
+#
+# Run this in active-control mode:
+#   hermes_bench config/low_pressure_scenario.yaml \
+#       --run-id fp-check-001 \
+#       --hermes-bin build/hermesd \
+#       --replay-bin build/hermes_replay
+#
+# Pass/fail criterion (Phase 6d):
+#   intervention_count in the summary JSON should be 0 or at most 1.
+#   If it is higher, read reason_codes in predictions.ndjson to identify
+#   which predictor signal is triggering false interventions, then raise
+#   the corresponding threshold in config/schema.yaml.
+
+scenario_name: low-pressure
+runtime_mode: active-control
+warmup_s: 5
+measurement_s: 45
+repeat_count: 1
+
+# Tight thresholds — interventions should never fire at this load level.
+ups_elevated_threshold: 50
+ups_critical_threshold: 75
+
+# Targets: zero OOMs, latency well within budget, high completion.
+expected_max_p95_latency_ms: 5000
+expected_min_job_completion_rate: 1.0
+expected_max_oom_count: 0
+
+# Expected false positive count — used by hermes_bench --verify-targets.
+# Any intervention on a lightly-loaded host is a false positive.
+expected_max_intervention_count: 1
+
+workloads:
+  - name: inference_fg
+    role: foreground
+    # Light compute — same shape as baseline but no contending background jobs.
+    command: >
+      python3 -c "
+      import time, math
+      for i in range(300):
+          _ = [math.sqrt(x * 1.0001) for x in range(3000)]
+          time.sleep(0.01)
+      "
+    # Smoke fallback: command: "python3 -c \"import time; time.sleep(30)\""
+    duration_s: 35
+    expected_exit_code: 0

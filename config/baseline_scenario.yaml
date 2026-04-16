@@ -1,0 +1,68 @@
+# Hermes baseline scenario — runs workloads WITHOUT any Hermes daemon.
+# This is the control arm. Run it first, then run observe_scenario.yaml or
+# oom_stress_scenario.yaml with active-control to measure before/after.
+#
+# FIDELITY WORKLOADS (Linux / WSL2 with stress-ng):
+#   These commands generate real CPU and memory pressure so PSI readings are
+#   non-zero and the comparison vs active-control is meaningful.
+#
+# SMOKE FALLBACK:
+#   For CI on Windows (no stress-ng), override each command with
+#   HERMES_SMOKE=1 or replace the commands with the _smoke variants below.
+#
+# Usage:
+#   hermes_bench config/baseline_scenario.yaml --run-id baseline-001
+#   hermes_bench config/baseline_scenario.yaml --runs 5 --run-id baseline
+
+scenario_name: baseline
+runtime_mode: baseline
+warmup_s: 10
+measurement_s: 60
+repeat_count: 1
+
+# Latency / completion targets (checked when --verify-targets is passed).
+expected_max_p95_latency_ms: 10000
+expected_min_job_completion_rate: 0.90
+expected_max_oom_count: 0
+
+# Workloads — real fidelity (Linux + Python 3 + stress-ng required).
+# The foreground inference loop measures its own per-iteration latency so
+# hermes_bench can compute p95 from the child's execution timestamps.
+workloads:
+  - name: inference_fg
+    role: foreground
+    # Tight CPU compute loop — 500 iterations, each ~10 ms of math work.
+    # Replace with a real torch inference loop on GPU hosts (Tier C).
+    command: >
+      python3 -c "
+      import time, math
+      for i in range(500):
+          _ = [math.sqrt(x * 1.0001) for x in range(5000)]
+          time.sleep(0.005)
+      "
+    # Smoke fallback (CI / Windows): command: "python3 -c \"import time; time.sleep(30)\""
+    duration_s: 40
+    expected_exit_code: 0
+
+  - name: mem_hog_bg
+    role: background
+    # Allocates and holds 2 GB of RAM for the duration of the run.
+    # Generates real mem_some_avg10 pressure once the allocator commits the pages.
+    command: >
+      python3 -c "
+      import time
+      buf = bytearray(2 * 1024 * 1024 * 1024)
+      time.sleep(70)
+      "
+    # Smoke fallback: command: "python3 -c \"import time; time.sleep(60)\""
+    duration_s: 60
+    expected_exit_code: 0
+
+  - name: cpu_stress_bg
+    role: background
+    # Burns 2 CPU cores for 50 s — generates cpu_some_avg10 > 15.
+    # On machines without stress-ng, replace with the Python fallback below.
+    command: "stress-ng --cpu 2 --timeout 50s --quiet"
+    # Python fallback: command: "python3 -c \"import math; [math.factorial(50000) for _ in range(10000)]\""
+    duration_s: 55
+    expected_exit_code: 0

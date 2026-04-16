@@ -1,0 +1,71 @@
+# oom_stress_scenario.yaml — Memory/VRAM pressure scenario for OOM-kill intervention testing.
+#
+# Purpose:
+#   Verify that Hermes active-control mode prevents OOM kills and keeps
+#   the foreground inference job within the p95 latency target while
+#   background processes are consuming most available memory.
+#
+# Expected outcomes when Hermes is active:
+#   - oom_count = 0 (Hermes throttles / kills background hogs before OOM)
+#   - p95 latency < 8000 ms
+#   - completion_rate >= 0.85
+#
+# Usage:
+#   hermes_bench config/oom_stress_scenario.yaml \
+#       --hermes-bin build/hermesd \
+#       --replay-bin build/hermes_replay \
+#       --runs 3 \
+#       --auto-compare \
+#       --verify-targets
+#
+# Prerequisites (Linux / WSL2):
+#   apt install stress-ng python3
+#
+# To compare against baseline (no Hermes), run the baseline scenario first:
+#   hermes_bench config/baseline_scenario.yaml --runs 3
+#   hermes_bench config/oom_stress_scenario.yaml --runs 3 --auto-compare
+
+name: oom-stress-intervention
+runtime_mode: active-control
+warmup_s: 5
+measurement_s: 60
+repeat_count: 3
+
+# UPS thresholds — lower critical threshold to trigger L2/L3 actions sooner
+# under memory pressure without waiting for PSI to be maxed out.
+ups_elevated_threshold: 45
+ups_critical_threshold: 70
+
+# Assertions checked by --verify-targets
+expected_max_oom_count: 0
+expected_max_p95_latency_ms: 8000
+expected_min_job_completion_rate: 0.85
+
+workloads:
+  # Foreground: latency-sensitive inference job (Hermes must protect this).
+  - name: inference_fg
+    command: "python3 -c \"import time, sys; buf=[bytearray(50*1024*1024) for _ in range(20)]; [time.sleep(0.5) for _ in range(20)]; print('inference done')\""
+    foreground: true
+    background: false
+    duration_s: 60
+
+  # Background: stress-ng virtual memory hog (triggers PSI + potential OOM).
+  - name: mem_hog_stress
+    command: "stress-ng --vm 2 --vm-bytes 512M --timeout 60s"
+    foreground: false
+    background: true
+    duration_s: 60
+
+  # Background: Python large allocation that holds memory for the full run.
+  - name: mem_hog_python
+    command: "python3 -c \"import time; buf=bytearray(800*1024*1024); time.sleep(55)\""
+    foreground: false
+    background: true
+    duration_s: 60
+
+  # Background: CPU pressure to push PSI scores and trigger UPS elevation.
+  - name: cpu_pressure
+    command: "stress-ng --cpu 2 --timeout 60s"
+    foreground: false
+    background: true
+    duration_s: 60

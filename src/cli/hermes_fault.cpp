@@ -15,7 +15,8 @@
 //   io_storm         — io_full_avg10 spikes to 35, io_some_avg10 to 50
 //   mixed_pressure   — moderate CPU + mem + IO all elevated simultaneously
 //   oom_imminent     — VRAM 99%+ AND mem_full_avg10 50+ AND cpu_full_avg10 90+
-//   all              — generate all six scenarios
+//   recovery_resume  — critical pressure → abrupt drop → gradual pressure resume
+//   all              — generate all seven scenarios
 //
 // Usage:
 //   hermes_fault [--out-dir artifacts/fault_injection] [--scenario <name>]
@@ -58,7 +59,7 @@ void print_usage() {
         << "Options:\n"
         << "  --out-dir <dir>      Output root (default: artifacts/fault_injection)\n"
         << "  --scenario <name>    One of: vram_spike, mem_storm, cpu_hog, io_storm,\n"
-        << "                               mixed_pressure, oom_imminent, all\n"
+        << "                               mixed_pressure, oom_imminent, recovery_resume, all\n"
         << "                       Default: all\n";
 }
 
@@ -379,6 +380,77 @@ std::vector<FaultSample> gen_oom_imminent() {
     return samples;
 }
 
+// Scenario 7: Recovery resume — starts at critical pressure (scheduler enters throttled /
+// terminate_candidate), then drops sharply (workload exits), then gradually resumes moderate
+// load. Exercises the full recovery state transition without re-triggering critical pressure.
+std::vector<FaultSample> gen_recovery_resume() {
+    // Phase 1 (20 samples): critical pressure
+    auto samples = make_warmup(10);
+    const int phase1_count = 20;
+    for (int i = 0; i < phase1_count; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(phase1_count - 1);
+        FaultSample s;
+        const int idx = 10 + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.cpu_some_avg10 = 70.0 + 20.0 * t;
+        s.cpu_full_avg10 = 30.0 + 30.0 * t;
+        s.mem_some_avg10 = 55.0 + 25.0 * t;
+        s.mem_full_avg10 = 20.0 + 35.0 * t;
+        s.gpu_util_pct   = 90.0 + 8.0 * t;
+        s.vram_used_mb   = 20000.0 + 3000.0 * t;
+        s.vram_total_mb  = 24576.0;
+        s.vram_free_mb   = s.vram_total_mb - std::min(s.vram_used_mb, s.vram_total_mb);
+        s.loadavg_runnable = 14 + static_cast<uint32_t>(6.0 * t);
+        s.vmstat_pgmajfault = 1200 + static_cast<uint64_t>(i) * 100;
+        s.vmstat_pgfault    = 55000 + static_cast<uint64_t>(i) * 3000;
+        samples.push_back(s);
+    }
+    // Phase 2 (5 samples): abrupt drop — workload exits
+    const int phase2_count = 5;
+    for (int i = 0; i < phase2_count; ++i) {
+        FaultSample s;
+        const int idx = 30 + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        const double drop = static_cast<double>(phase2_count - i) / static_cast<double>(phase2_count);
+        s.cpu_some_avg10 = 5.0 + 20.0 * drop;
+        s.cpu_full_avg10 = 1.0 + 10.0 * drop;
+        s.mem_some_avg10 = 4.0 + 15.0 * drop;
+        s.mem_full_avg10 = 0.5 + 5.0 * drop;
+        s.gpu_util_pct   = 15.0 + 30.0 * drop;
+        s.vram_used_mb   = 2000.0 + 5000.0 * drop;
+        s.vram_total_mb  = 24576.0;
+        s.vram_free_mb   = s.vram_total_mb - s.vram_used_mb;
+        s.loadavg_runnable = 3;
+        s.vmstat_pgmajfault = 3200 + static_cast<uint64_t>(i) * 5;
+        s.vmstat_pgfault    = 115000 + static_cast<uint64_t>(i) * 100;
+        samples.push_back(s);
+    }
+    // Phase 3 (20 samples): gradual resume — new moderate workload spins up
+    const int phase3_count = 20;
+    for (int i = 0; i < phase3_count; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(phase3_count - 1);
+        FaultSample s;
+        const int idx = 35 + i;
+        s.ts_wall = BASE_WALL_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.ts_mono = BASE_MONO_MS + static_cast<uint64_t>(idx) * STEP_MS;
+        s.cpu_some_avg10 = 5.0 + 25.0 * t;
+        s.cpu_full_avg10 = 0.5 + 8.0 * t;
+        s.mem_some_avg10 = 3.0 + 18.0 * t;
+        s.mem_full_avg10 = 0.2 + 4.0 * t;
+        s.gpu_util_pct   = 10.0 + 45.0 * t;
+        s.vram_used_mb   = 1500.0 + 8000.0 * t;
+        s.vram_total_mb  = 24576.0;
+        s.vram_free_mb   = s.vram_total_mb - s.vram_used_mb;
+        s.loadavg_runnable = 2 + static_cast<uint32_t>(4.0 * t);
+        s.vmstat_pgmajfault = 3225 + static_cast<uint64_t>(i) * 8;
+        s.vmstat_pgfault    = 115500 + static_cast<uint64_t>(i) * 200;
+        samples.push_back(s);
+    }
+    return samples;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -406,12 +478,13 @@ int main(int argc, char** argv) {
     };
 
     const std::vector<ScenarioDef> all_scenarios = {
-        {"vram_spike",      "VRAM ramps from 35% to 98% of 24 GB over 60 samples",               gen_vram_spike},
-        {"mem_storm",       "mem_full_avg10 spikes 0->50; vmstat_pgmajfault grows rapidly",       gen_mem_storm},
-        {"cpu_hog",         "cpu_some_avg10 pinned at 95-99% for 40 samples",                    gen_cpu_hog},
-        {"io_storm",        "io_full_avg10 spikes to 35, io_some_avg10 to 50 over 45 samples",   gen_io_storm},
-        {"mixed_pressure",  "CPU + mem + IO all moderately elevated simultaneously",              gen_mixed_pressure},
-        {"oom_imminent",    "VRAM 99%+ AND mem_full 50+ AND cpu_full 90+ — imminent OOM",        gen_oom_imminent},
+        {"vram_spike",       "VRAM ramps from 35% to 98% of 24 GB over 60 samples",               gen_vram_spike},
+        {"mem_storm",        "mem_full_avg10 spikes 0->50; vmstat_pgmajfault grows rapidly",       gen_mem_storm},
+        {"cpu_hog",          "cpu_some_avg10 pinned at 95-99% for 40 samples",                    gen_cpu_hog},
+        {"io_storm",         "io_full_avg10 spikes to 35, io_some_avg10 to 50 over 45 samples",   gen_io_storm},
+        {"mixed_pressure",   "CPU + mem + IO all moderately elevated simultaneously",              gen_mixed_pressure},
+        {"oom_imminent",     "VRAM 99%+ AND mem_full 50+ AND cpu_full 90+ — imminent OOM",        gen_oom_imminent},
+        {"recovery_resume",  "Critical pressure -> abrupt drop -> gradual resume (tests recovery)", gen_recovery_resume},
     };
 
     int written = 0;

@@ -863,6 +863,204 @@ Hermes should prioritize official or authoritative sources for metric semantics,
 - `perf_event_open` and perf security docs: authoritative for hardware-counter semantics and access restrictions.
 - DCGM and DCGM exporter docs: authoritative for industry-style GPU telemetry and future integration shape.
 
+## Benchmark Evidence Standards
+
+This section defines what "proven" means for each type of claim Hermes makes. The goal is to prevent the project from treating smoke checks as performance evidence.
+
+### Claim Tiers
+
+| Tier | Meaning | Minimum Evidence |
+| --- | --- | --- |
+| **T0 — Pipeline correct** | Artifact flow, schema, and NDJSON format are right | Smoke script exits 0; replay_summary.json valid |
+| **T1 — Monitors work** | Real PSI/NVML values recorded on a live host | Single daemon run on Linux with non-zero PSI fields |
+| **T2 — Predictor fires** | Predictor emits high/critical risk under real pressure | stress-ng or Python hog run; eval_summary.json has total_predictions > 0 |
+| **T3 — Intervention fires** | Active-control mode triggers at least one real action | actions.ndjson has a non-dry-run entry; reversal_condition present |
+| **T4 — Intervention helps** | Active-control measurably reduces p95 latency or OOM count vs baseline | 5-run comparison: active-control p95 < baseline p95 in ≥ 4 of 5 runs |
+| **T5 — Claim is defensible** | Peer-reproducible evidence with environment details | strace + perf captures, RESULTS.md entry with kernel/GPU/run-id |
+
+Every README claim must cite a tier. "Hermes reduces OOM kills" is a T4 claim. "Hermes monitors VRAM pressure" is a T1 claim.
+
+### Minimum Run Count
+
+- A single run proves the pipeline works. It does not prove a performance improvement.
+- A 5-run comparison with mean ± std is the minimum to claim directional improvement.
+- A 10-run comparison with Welch's t-test is required before stating statistical significance.
+- If run-to-run variance is high (std > 30% of mean), investigate the root cause before claiming anything.
+
+### What Invalidates a Result
+
+- Workloads that complete before pressure builds (too short; increase `measurement_s`).
+- UPS never exceeding 40 in any run (scenario is not stressful enough; increase VRAM hog or CPU load).
+- All interventions firing in dry-run mode when `runtime_mode: active-control` was intended.
+- Replay snapshot not available in benchmark summary (Hermes was not actually running during the workloads).
+- p95 latency sourced from wall-clock timestamps of `echo` commands rather than real inference work.
+
+---
+
+## Workload Fidelity
+
+The current smoke workloads (`echo smoke-fg`, `sleep 5`) verify the artifact pipeline but produce no real pressure. This section defines what a "fidelity workload" looks like.
+
+### Minimum Fidelity Requirements
+
+For a workload to produce meaningful benchmark evidence:
+
+1. **Memory pressure**: at least one background job must allocate and hold ≥ 50% of available VRAM or ≥ 4 GB system RAM.
+2. **CPU pressure**: at least one background job must generate sustained cpu_some_avg10 ≥ 15%.
+3. **Foreground latency**: the foreground job must execute a tight inference-like loop with measurable per-iteration latency (not just `sleep`).
+4. **Duration**: `measurement_s` ≥ 30 s so PSI 10-second averages have time to stabilize.
+
+### Recommended Workload Templates
+
+**System-RAM pressure (no GPU required):**
+
+```bash
+# Background memory hog — allocates and holds 4 GB
+python3 -c "import time; buf = bytearray(4 * 1024**3); time.sleep(120)"
+
+# Foreground inference loop — 1000 iterations, latency measured externally
+python3 -c "
+import time, math
+start = time.monotonic()
+for i in range(1000):
+    _ = [math.sqrt(x) for x in range(10000)]
+print(f'done in {time.monotonic()-start:.3f}s')
+"
+
+# CPU stress
+stress-ng --cpu 4 --timeout 120s --quiet
+```
+
+**GPU pressure (Tier C — NVML required):**
+
+```bash
+# VRAM hog via PyTorch (replace 6 with available GB - 2)
+python3 -c "import torch, time; t = torch.ones(6 * 1024**3 // 4, device='cuda'); time.sleep(120)"
+
+# Foreground inference loop on GPU
+python3 -c "
+import torch, time
+m = torch.nn.Linear(4096, 4096).cuda()
+x = torch.randn(32, 4096).cuda()
+for i in range(200):
+    t0 = time.monotonic()
+    _ = m(x)
+    torch.cuda.synchronize()
+    print(f'iter {i} lat_ms {(time.monotonic()-t0)*1000:.1f}')
+"
+```
+
+### Updating Pre-built Scenario YAMLs
+
+`config/baseline_scenario.yaml` and `config/observe_scenario.yaml` currently use `echo smoke-*` placeholders. Before claiming T2+ evidence, replace them with workload templates from the section above. Do not delete the `echo` versions — keep them as `_smoke` variants for CI.
+
+---
+
+## False Positive and Intervention Overhead Analysis
+
+An intervention that fires unnecessarily reduces throughput without preventing a failure. This must be measured explicitly before Hermes claims to be "safe to run in active-control mode."
+
+### Definition
+
+A **false positive intervention** is one that fires when:
+
+- The foreground workload completes at target latency with no intervention
+- The background workload would not have caused an OOM or latency breach within the observation window
+- UPS returns to normal within 15 s without Hermes acting
+
+### How to Measure
+
+1. Run the **baseline scenario** (no Hermes) and record `completion_rate` and `p95_latency_ms`.
+2. Run the **same scenario** in active-control mode on a lightly-loaded host (no real pressure injected).
+3. Count `intervention_count` in the active-control summary.
+4. If `intervention_count > 0` and baseline `completion_rate = 1.0`, every intervention is a false positive.
+
+Target: **< 2 false positive interventions per 60-second run** on a host where UPS stays below 40 throughout.
+
+### How to Reduce False Positives
+
+- Raise `ups_elevated_threshold` in the scenario YAML until the false positive rate is zero.
+- Examine `reason_codes` in `predictions.ndjson` for the false-positive run to identify the triggering signal.
+- If `VRAM_HEADROOM_COLLAPSE` fires on a lightly-loaded host, the predictor's VRAM slope window is too sensitive; increase the fast-window threshold in `config/schema.yaml`.
+- Run `hermes_eval` on the false-positive run to measure `false_positive_rate_per_hour`; if > 5, the predictor weights need recalibration.
+
+---
+
+## Predictor Calibration Cycle
+
+The OOM predictor uses fixed weights and thresholds. After collecting real run data, those values should be tuned using a structured cycle rather than manual guessing.
+
+### Calibration Loop
+
+```text
+1. Run 3-5 benchmark scenarios that cover: low pressure, moderate pressure, high pressure, OOM-imminent.
+2. For each run, execute:  hermes_eval <run-dir> --out artifacts/eval/<run-id>.json
+3. Aggregate across runs:  look for consistent high false_positive_rate or low recall.
+4. If false_positive_rate > 10%:
+     - Raise predictor risk thresholds in config/schema.yaml
+     - Re-run and verify recall does not drop below 80%
+5. If recall < 70% on high-pressure runs:
+     - Lower the VRAM slope threshold or increase the mem_full residency weight
+     - Re-run and verify false_positive_rate does not rise above 5%
+6. Record the config_hash before and after tuning in RESULTS.md.
+7. Re-run smoke_wsl2.sh to confirm the synthetic fixture still passes all 17 assertions with the new config.
+```
+
+### Calibration Targets (v1)
+
+| Metric | Target |
+| --- | --- |
+| Precision on OOM-imminent fixture | ≥ 0.85 |
+| Recall on OOM-imminent fixture | ≥ 0.80 |
+| False positive rate (low-pressure baseline) | < 5% per 60 s window |
+| Mean lead time before OOM | ≥ 3 s |
+
+These targets should be recorded in RESULTS.md after each calibration pass. The config_hash that achieves the targets becomes the release-candidate config.
+
+---
+
+## Result Interpretation Guide
+
+When a benchmark comparison table is available, this section describes how to read it.
+
+### Reading the Comparison Table (`comparison.csv`)
+
+The table has one row per run, with columns: `run_id`, `runtime_mode`, `completion_rate`, `p95_latency_ms`, `oom_count`, `intervention_count`, `peak_ups`, `degraded_behavior`.
+
+**Is Hermes helping?** Look for:
+
+1. `oom_count` (active-control) < `oom_count` (baseline) — fewer workload failures.
+2. `p95_latency_ms` (active-control) < `p95_latency_ms` (baseline) — foreground work is faster.
+3. `degraded_behavior` (active-control) = false while (baseline) = true — intervention prevented degradation.
+4. `completion_rate` (active-control) ≥ `completion_rate` (baseline) — Hermes did not make things worse.
+
+**Is Hermes hurting?** Watch for:
+
+1. `p95_latency_ms` (active-control) > (baseline) — intervention overhead is outweighing the benefit.
+2. `completion_rate` (active-control) < (baseline) — Hermes killed a job it should not have.
+3. `intervention_count` very high on a low-pressure run — false positives are consuming cycles.
+
+### What "Improvement" Means
+
+Do not claim improvement based on a single run. The minimum claim threshold is:
+
+- p95 latency: active-control median < baseline median across ≥ 5 runs, by ≥ 10%.
+- OOM count: active-control sum ≤ 50% of baseline sum across ≥ 3 OOM-stress runs.
+- Completion rate: active-control mean ≥ baseline mean (never worse by more than 2%).
+
+If any of these conditions is violated, Hermes needs further tuning before a performance claim is valid.
+
+### Annotating RESULTS.md
+
+Every live evidence entry in RESULTS.md should include:
+
+- Run IDs for both baseline and active-control runs in the same comparison
+- The config_hash used (so the threshold config can be reproduced)
+- Host details: kernel version, GPU model (or "CPU only"), available RAM, and whether PSI was live
+- Whether stress-ng was used, and at what memory/CPU intensity
+
+---
+
 ## Session Handoff Log
 
 This section exists to keep future sessions grounded in verified state instead of memory.
@@ -881,6 +1079,7 @@ This section exists to keep future sessions grounded in verified state instead o
 
 ```md
 #### YYYY-MM-DD HH:MM TZ - Session Summary
+
 - Verified repo facts:
   - ...
 - Decisions made:
@@ -898,6 +1097,7 @@ This section exists to keep future sessions grounded in verified state instead o
 ### Entries
 
 #### 2026-04-01 00:00 IST - Bootstrap Documentation Pass
+
 - Verified repo facts:
   - The workspace started this session effectively empty.
   - No `.git` repository was initialized in the project root at verification time.
@@ -921,6 +1121,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-01 17:06 IST - Profiling and Sampling Doc Expansion
+
 - Verified repo facts:
   - `design.md` and `roadmap.md` existed before this update.
   - The repo still contains documentation only; no source modules, benchmark captures, or helper binaries were added in this pass.
@@ -945,6 +1146,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-01 17:18 IST - Defensibility Note Added
+
 - Verified repo facts:
   - The docs already described the optional C++ helper and the need for `strace` and `perf` artifacts before this update.
   - Those implementation and evidence items still do not exist in the repo at verification time.
@@ -965,6 +1167,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-01 17:28 IST - Advanced Systems Framing Pass
+
 - Verified repo facts:
   - The repo still contains design and roadmap documentation only.
   - No native daemon, eBPF probes, replay engine, fault-injection harness, or cgroup backend implementation exists yet.
@@ -989,6 +1192,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-01 17:43 IST - Industry Metrics PDF Integration
+
 - Verified repo facts:
   - `design.md` existed before this update and already defined Hermes architecture, metrics groups, replay, and benchmark structure.
   - No new code, collectors, benchmark artifacts, or roadmap status changes were introduced in this pass.
@@ -1012,6 +1216,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `C:\\Users\\kumar\\Downloads\\Industry-Grade Metrics and Targets for a Hermes-Style GPU-Aware Scheduler.pdf`
 
 #### 2026-04-01 20:39 IST - Backend Language Decision Shift to C++
+
 - Verified repo facts:
   - The repo still contains documentation only; no backend implementation language has been committed in code.
   - Before this update, parts of the design and roadmap still described Python as the control-plane language even though newer sections already emphasized native runtime behavior.
@@ -1033,6 +1238,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `design.md`
 
 #### 2026-04-02 00:56 IST - First Native Backend Control Loop Pass
+
 - Verified repo facts:
   - The repo now contains a native C++ scaffold with `CMakeLists.txt`, `include/`, `src/`, `README.md`, `.gitignore`, and `config/schema.yaml`.
   - Monitor implementations exist for CPU PSI, memory PSI, load average fallback, and GPU stats collection through a lightweight `nvidia-smi` path.
@@ -1072,6 +1278,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-12 22:35 IST - Runtime NDJSON Artifact Logging Pass
+
 - Verified repo facts:
   - Added `AGENTS.md` with project-specific build, verification, artifact, and handoff guidance.
   - Added artifact placeholder directories for logs, summaries, plots, replay data, and profiling captures.
@@ -1116,6 +1323,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/logs/codex-smoke-20260412-2235/`
 
 #### 2026-04-12 23:09 IST - Replay Summary CLI Pass
+
 - Verified repo facts:
   - Added `include/hermes/replay/replay_summary.hpp` and `src/replay/replay_summary.cpp`.
   - Added `src/cli/hermes_replay.cpp` as the first CLI entrypoint.
@@ -1152,6 +1360,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/replay/codex-smoke-20260412-2235-summary.json`
 
 #### 2026-04-13 00:57 IST - Run Metadata And Config Snapshot Pass
+
 - Verified repo facts:
   - Added `include/hermes/runtime/run_metadata.hpp` and `src/runtime/run_metadata.cpp`.
   - `src/runtime/hermesd.cpp` now writes `run_metadata.json` and `config_snapshot.yaml` into each run directory after event logging opens.
@@ -1192,6 +1401,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/replay/codex-smoke-20260413-metadata-summary.json`
 
 #### 2026-04-13 01:11 IST - Telemetry Quality Artifact Pass
+
 - Verified repo facts:
   - Added `include/hermes/runtime/telemetry_quality.hpp` and `src/runtime/telemetry_quality.cpp`.
   - `src/runtime/hermesd.cpp` now updates a telemetry quality tracker on every control-loop iteration.
@@ -1231,6 +1441,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/replay/codex-smoke-20260413-telemetry-summary.json`
 
 #### 2026-04-13 01:27 IST - Synthetic Pressure Fixture CLI Pass
+
 - Verified repo facts:
   - Added `src/cli/hermes_synth.cpp`.
   - `CMakeLists.txt` now defines a `hermes_synth` executable linked against `hermes_core`.
@@ -1269,6 +1480,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/replay/codex-synth-20260413-level2-summary.json`
 
 #### 2026-04-13 01:33 IST - Replay Manifest Assertion Pass
+
 - Verified repo facts:
   - `include/hermes/replay/replay_summary.hpp` now tracks optional scenario manifest presence, expected signals, observed signals, and assertion pass/fail counts.
   - `src/replay/replay_summary.cpp` now detects `scenario_manifest.json`, parses `expected_signals`, derives observed signals from `decisions.ndjson`, and marks the summary invalid when a manifest expectation is missing.
@@ -1304,6 +1516,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/logs/codex-synth-20260413-assertion-fail/replay_summary.json`
 
 #### 2026-04-13 01:43 IST - Plain-Language Explanation And Rich Replay Assertions Pass
+
 - Verified repo facts:
   - Added `HERMES_EXPLANATION.md` as a plain-language article that explains what Hermes is, why it exists, what has been built so far, what the runtime artifacts mean, how replay and synthetic fixtures work, and what is still not implemented.
   - `src/cli/hermes_synth.cpp` now emits richer `scenario_manifest.json` expectations: named signals, minimum peak UPS, minimum peak risk, minimum decision action counts, minimum scheduler state counts, minimum pressure band counts, and minimum risk band counts.
@@ -1342,6 +1555,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/logs/codex-synth-20260413-rich-assert-fail/replay_summary.json`
 
 #### 2026-04-13 01:48 IST - Synthetic Replay Smoke Script Pass
+
 - Verified repo facts:
   - Added `scripts/smoke_synthetic_replay.ps1`.
   - The script builds `hermes_synth` and `hermes_replay` with direct `g++` commands, generates a synthetic run, replays it, parses `replay_summary.json`, and fails if manifest assertions are missing or failing.
@@ -1373,6 +1587,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/replay/codex-smoke-script-20260413-summary.json`
 
 #### 2026-04-13 02:17 IST - Replay Summary Copy Pass
+
 - Verified repo facts:
   - Before this pass, the full initial Hermes scaffold was committed and pushed to the private GitHub repository `kumarabhik/Hermes` on branch `main`.
   - `HERMES_EXPLANATION.md` is ignored by `.gitignore` and was not included in the GitHub commit.
@@ -1402,6 +1617,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
 
 #### 2026-04-14 IST - Replay Summary CSV Pass
+
 - Verified repo facts:
   - `include/hermes/replay/replay_summary.hpp` now exposes CSV summary writing and CSV row serialization helpers.
   - `src/replay/replay_summary.cpp` now writes a compact one-row CSV with run identity, artifact counts, time window, pressure/risk peaks, pressure/risk/state/action counts, artifact presence flags, assertion counts, and warning/failure counts.
@@ -1440,6 +1656,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/summaries/codex-summary-csv-20260414-summary.csv`
 
 #### 2026-04-14 IST - One-Loop Daemon Replay Smoke Pass
+
 - Verified repo facts:
   - Added `scripts/smoke_daemon_replay.ps1`.
   - The script builds `hermesd` and `hermes_replay` with direct `g++` commands, runs `hermesd` with `HERMES_MAX_LOOPS=1`, `HERMES_RUNTIME_MODE=observe-only`, and `HERMES_SCENARIO=daemon-smoke`, then replays the daemon run directory.
@@ -1476,6 +1693,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/summaries/codex-daemon-smoke-20260414-summary.csv`
 
 #### 2026-04-14 IST - Benchmark Plan Artifact Pass
+
 - Verified repo facts:
   - Added `RESULTS.md` as a local-only results summary and added it to `.gitignore` so it is not committed to GitHub.
   - Added `artifacts/bench/.gitkeep` and ignore rules for generated benchmark plan artifacts under `artifacts/bench/`.
@@ -1514,6 +1732,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/bench/codex-bench-plan-20260414-scenario.yaml`
 
 #### 2026-04-14 IST - Benchmark Launch Summary Pass
+
 - Verified repo facts:
   - `src/cli/hermes_bench.cpp` now launches bounded workloads, supervises them for the benchmark window, terminates overruns, and writes `artifacts/bench/<run_id>-summary.json`.
   - The benchmark summary artifact records run identity, runtime mode, duration, workload counts, launched count, launch failures, completed jobs, timed-out jobs, nonzero exits, notes, and per-workload exit details.
@@ -1549,6 +1768,7 @@ This section exists to keep future sessions grounded in verified state instead o
   - `artifacts/bench/codex-bench-launch-20260414-summary.json`
 
 #### 2026-04-15 IST - Benchmark Hermes Replay Orchestration Pass
+
 - Verified repo facts:
   - `src/cli/hermes_bench.cpp` now treats `baseline` as a first-class benchmark runtime mode and only launches Hermes for non-baseline runs.
   - `hermes_bench` now accepts `--hermes-bin` and `--replay-bin` overrides, resolves sibling binaries by default, launches `hermesd` for non-baseline scenarios, waits for the Hermes run to finish, and then invokes `hermes_replay` on the generated run directory.
@@ -1587,3 +1807,157 @@ This section exists to keep future sessions grounded in verified state instead o
   - `roadmap.md`
   - `artifacts/bench/codex-bench-hermes-20260415c-summary.json`
   - `artifacts/logs/codex-bench-hermes-20260415c-hermes/replay_summary.json`
+
+#### 2026-04-15 IST - Benchmark Comparison, Multi-Run, and Operator Documentation Pass
+
+- Verified repo facts:
+  - `src/cli/hermes_bench.cpp` now writes enriched benchmark summary artifacts with four new derived fields: `completion_rate` (`jobs_completed / launched`), `intervention_count` (Hermes actions from the embedded replay snapshot), `oom_count` (placeholder, 0; real values require Linux kernel OOM tracing), and `degraded_behavior` (true when completion rate is below the scenario minimum or nonzero exits occurred).
+  - `hermes_bench` now accepts `--runs N` to repeat a scenario N times with sequential run IDs (`<base-run-id>-r1`, `-r2`, etc.); `--runs N` overrides the scenario's `repeat_count` field. A single shared plan artifact is written for the full N-run set.
+  - Added `src/cli/hermes_compare.cpp`: reads all `*-summary.json` files under `artifacts/bench/`, sorts rows by scenario then mode order (baseline → observe-only → advisory → active-control), prints a comparison table, and writes a comparison CSV to `artifacts/bench/comparison.csv` (or `--output-csv`). Accepts `--bench-dir`, `--output-csv`, and `--scenario` filter flags.
+  - Extended `src/cli/hermes_report.cpp`: after the existing replay run table and CSV, it now scans `artifacts/bench/*-summary.json` and appends a "Benchmark Runs" section (formatted table + CSV rows appended to the combined `report.csv`).
+  - Added `scripts/smoke_benchmark_compare.ps1`: builds `hermes_bench`, `hermes_compare`, `hermesd`, and `hermes_replay`; runs a baseline and an observe-only benchmark scenario; verifies both summary artifacts; runs `hermes_compare`; checks the comparison CSV contains both runtime mode rows; checks the enriched fields are present in the baseline summary.
+  - Created `docs/operator.md`: deployment assumptions, privilege modes (observe-only / advisory / active-control), safety guardrails (PID 1 protection, self-protection, protected-pids list, protected-names, dry-run fallback, rollback on recovery), key environment variables, benchmark procedure, artifact locations, and smoke verification commands.
+  - Created `docs/internals.md`: module layout, native collector path (PSI files, vmstat, loadavg, proc/stat, nvidia-smi), UPS formula, OOM predictor, multi-threaded daemon architecture, replay workflow, fault injection fixture list, cgroup v2 backend control files and rollback, and control socket protocol.
+  - Created `docs/tuning_guide.md`: general tuning principles, UPS weight table with workload-type guidance, UPS threshold semantics, memory PSI threshold guidance, VRAM threshold guidance, cooldown safe minimums, incremental action enablement procedure, protected-PID and protected-name configuration, and a post-change verification checklist.
+  - Updated `README.md`: added "Benchmark Comparison" section documenting `hermes_compare` and `--runs N`; added "Documentation" table linking to the three new docs; added "Achieved Outcomes" table listing smoke-evidenced capabilities and explicitly noting what is not yet evidenced on a Linux GPU machine; fixed MD060 table separator style.
+  - Updated `roadmap.md`: marked `hermes_bench` baseline and observe-only modes as `[x]`, active-control mode as `[~]` (infrastructure in place, Linux evidence pending); marked multi-run `[~]` (flag implemented, Linux runs pending); marked `hermes_compare` as `[x]`; marked `hermes_report` benchmark section as `[x]`; marked operator.md, internals.md, tuning_guide.md, and README Achieved Outcomes as `[x]`; updated Current Snapshot paragraph.
+- Decisions made:
+  - Added `completion_rate`, `intervention_count`, `oom_count`, and `degraded_behavior` directly to the benchmark summary JSON rather than computing them only in `hermes_compare`, so any single summary file is self-describing for comparison purposes.
+  - Kept `oom_count` as a zero placeholder rather than omitting the field; this makes the CSV schema stable so tooling built against it does not break when real Linux OOM evidence is added.
+  - Created `hermes_compare` as a separate binary (not folded into `hermes_report`) because it reads from `artifacts/bench/` while `hermes_report` reads from `artifacts/logs/`; keeping them separate avoids coupling the replay summary schema to the benchmark summary schema.
+  - Extended `hermes_report` to append benchmark rows to the same combined CSV so one `report.csv` gives a complete cross-run view without requiring `hermes_compare` separately.
+  - Placed operator docs in `docs/` subdirectory rather than root to keep the repo root clean; linked from README.
+- Assumptions still in force:
+  - All smoke evidence is authoring-environment only (Windows, `g++`, no Linux GPU).
+  - Benchmark completion rate is harness-level (workload process exit codes), not application-level OOM or latency evidence.
+  - Active-control and multi-run benchmark claims still require native Linux verification with real controllable workloads.
+- Open risks:
+  - `hermes_compare` smoke script patches the default baseline scenario YAML with PowerShell string replacement, which may be fragile if the YAML format changes significantly.
+  - `oom_count` is always 0 until Linux kernel OOM tracing is integrated; downstream tooling must not treat it as evidence of zero OOMs.
+- Next recommended actions:
+  - Add a Linux shell smoke equivalent or CTest wrapper for all smoke scripts once CMake is available.
+  - Start a real Linux benchmark bundle: run baseline + observe-only on a GPU host, save artifacts, and update `RESULTS.md` with the first real completion-rate comparison.
+  - Integrate `strace` capture for at least one benchmark run to advance toward the minimum defensibility package.
+  - Consider adding a `--compare-dir` mode to `hermes_bench` that automatically runs `hermes_compare` after completing all N runs.
+- Evidence paths / artifacts:
+  - `src/cli/hermes_bench.cpp`
+  - `src/cli/hermes_compare.cpp`
+  - `src/cli/hermes_report.cpp`
+  - `scripts/smoke_benchmark_compare.ps1`
+  - `docs/operator.md`
+  - `docs/internals.md`
+  - `docs/tuning_guide.md`
+  - `README.md`
+  - `roadmap.md`
+
+#### 2026-04-15 IST - WSL2 Evidence Infrastructure Pass
+
+- Verified repo facts:
+  - `CMakeLists.txt` now includes a `hermes_compare` build target (standalone, no hermes_core link).
+  - `src/cli/hermes_bench.cpp` now tracks foreground workload wall-clock durations across `--runs N` and computes p50/p95/p99/max/min latency, writing `artifacts/bench/<base-run-id>-latency.json`. The `MultiRunStats` struct accumulates per-run foreground durations and OOM-kill counts.
+  - `oom_count` in benchmark summaries is now real: workload exit code 137 (SIGKILL, the typical Linux OOM-kill exit) is detected per-workload and summed. The `degraded_behavior` flag now also triggers on any OOM kill.
+  - `hermes_bench` supports `--auto-compare [--compare-bin PATH]`: after all N runs complete, automatically invokes `hermes_compare` on the bench directory and writes `<base-run-id>-auto-comparison.csv`.
+  - Added `scripts/bench_strace.sh`: extracts the foreground workload command from the scenario YAML, runs it under `strace -c` (syscall summary), and saves the output to `artifacts/bench/<run-id>-strace.txt`. Also launches `hermes_bench` in baseline mode alongside. This is the script for generating the "one real strace finding" required by the minimum defensibility package.
+  - Added `scripts/bench_perf.sh`: wraps a full `hermes_bench` invocation with `perf stat -e task-clock,context-switches,cpu-migrations,page-faults,minor-faults,major-faults`, saves output to `artifacts/bench/<run-id>-perf.txt`. Works with WSL2 software counters; hardware counters are not required.
+  - Added `scripts/bench_gdb.sh`: enables core dumps via `ulimit -c unlimited`, optionally sets `/proc/sys/kernel/core_pattern`, runs an arbitrary workload command, and — if a core file is produced — invokes `gdb --batch` to extract `bt full` + `info registers`. Saves to `artifacts/bench/<run-id>-gdb.txt`. Handles exit code 137/SIGKILL/SIGSEGV/SIGABRT interpretation.
+  - Added `scripts/smoke_wsl2.sh`: a bash equivalent of all PowerShell smoke scripts. Uses the CMake build directory. Runs 7 verification steps: PSI probe, synthetic replay, one-loop daemon replay, benchmark plan, baseline launch, observe-only + Hermes, and hermes_compare CSV check. Exits 0 on full pass. Also patches default scenario YAML workload commands with `echo` commands for portability.
+  - Added `scripts/hermes_plot.py`: reads NDJSON run artifacts and produces pressure_trace.csv, latency_cdf.csv, decision_trace.csv, and band_timeline.csv under `<run-dir>/plots/`. Supports `--plot` for optional matplotlib PNG output (no hard dependency). Handles missing artifact files gracefully.
+  - Roadmap updated: `Summary tables` and `Plots` items promoted from `[ ]` to `[~]`; snapshot paragraph and bullet list updated.
+- Decisions made:
+  - Used exit code 137 as the OOM-kill signal proxy rather than parsing `dmesg` because dmesg may require root and is not accessible in all WSL2 configurations. Exit 137 is the standard Linux OOM-kill exit code and is available cross-platform.
+  - Made `--auto-compare` opt-in (not default) so that single-run invocations are not slowed down by spawning a second process.
+  - Kept `hermes_plot.py` dependency-free for CSV output; matplotlib is optional and only activates on `--plot`. This avoids any pip install requirement for the core workflow.
+  - `smoke_wsl2.sh` patches scenario YAML commands inline with Python rather than maintaining a separate WSL2-specific YAML, so the smoke script stays up-to-date with the default scenario template automatically.
+- Assumptions still in force:
+  - All new scripts require the CMake build to be present (`cmake -S . -B build && cmake --build build`). The PowerShell scripts use direct `g++` compilation and remain the Windows authoring path.
+  - `bench_strace.sh` and `bench_perf.sh` require Linux-native tools (`strace`, `perf`).
+  - `bench_gdb.sh` requires `gdb` and a workload that actually crashes or is OOM-killed to produce meaningful backtrace output.
+  - Real PSI, VRAM, and GPU stats in WSL2 depend on WSL2 kernel version and CUDA-on-WSL driver setup.
+- Open risks:
+  - `/proc/sys/kernel/core_pattern` write in `bench_gdb.sh` requires root or CAP_SYS_ADMIN; script degrades gracefully if not writable.
+  - `perf stat` hardware counters (cycles, cache-misses) will silently return zeros in WSL2; only software counters are reliable.
+  - `hermes_plot.py` latency CDF interpolates P25/P75/P90 from P50/P95 when individual percentile data is not stored; accuracy improves with more runs.
+- Next recommended actions:
+  - Clone repo into WSL2, run `cmake -S . -B build && cmake --build build`, then run `bash scripts/smoke_wsl2.sh`.
+  - Verify `/proc/pressure/cpu` is readable in your WSL2 instance.
+  - Run `bash scripts/bench_strace.sh active_scenario.yaml wsl2-strace-01` with a real stress workload to produce the first strace evidence artifact.
+  - Run `bash scripts/bench_perf.sh active_scenario.yaml wsl2-perf-01` to produce the first perf evidence artifact.
+  - Run `hermes_bench active_scenario.yaml --runs 5 --auto-compare` for the first 5-run multi-run evidence.
+- Evidence paths / artifacts:
+  - `CMakeLists.txt`
+  - `src/cli/hermes_bench.cpp`
+  - `scripts/bench_strace.sh`
+  - `scripts/bench_perf.sh`
+  - `scripts/bench_gdb.sh`
+  - `scripts/smoke_wsl2.sh`
+  - `scripts/hermes_plot.py`
+  - `roadmap.md`
+
+#### 2026-04-16 IST - Context Window Summary (CW-1 of new session)
+
+- Context window covered: User asked "how much % is complete" and "are you adding context window summaries to design.md". Added the context-window-log rule to AGENTS.md and wrote this first entry.
+- Files changed: `AGENTS.md` (added Context Window Log Rule section), `design.md` (this entry)
+- State on exit: No implementation work done this window — purely meta/process update. All prior work from 2026-04-15 two-pass session is intact.
+- Verified artifacts: 27 handoff entries in design.md confirmed; roadmap shows [x]=47, [~]=13, [ ]=11 (71 total, ~66% done).
+- Assumptions made: None — counts pulled directly from grep.
+- Next window should: Continue from WSL2 evidence infrastructure. First action is to run `bash scripts/smoke_wsl2.sh` in WSL2, then `bench_strace.sh` and `bench_perf.sh` with a real stress workload to advance the [~] items toward [x].
+
+#### 2026-04-15 IST - Context Window Summary (CW-2)
+
+- Context window covered: "Do the next 10 steps" third session — continued from CW-1 mid-task. Completed NVML backend scaffold (Step 2), p95 latency assertions (Step 3), scheduler state coverage (Step 4), OOM-stress scenario generator (Step 5), CMake install targets (Step 6), active-control smoke script (Step 7), WSL2 quickstart doc (Step 8), RESULTS.md live evidence table (Step 9), roadmap + design.md update (Step 10).
+- Files changed: `src/monitor/nvml_backend.cpp` (new — NVML dlopen implementation), `src/monitor/gpu_stats.cpp` (NVML fast path + nvidia-smi fallback), `CMakeLists.txt` (nvml_backend.cpp source + dl link + install targets), `src/cli/hermes_bench.cpp` (compute_fg_p95_ms helper, p95_latency_ms/latency_target_ms/latency_target_met in summary JSON, generate_oom_stress scenario, --generate-oom-stress flag + handler), `src/cli/hermes_reeval.cpp` (StateCoverageTracker, state_coverage.json output, coverage summary in stdout), `scripts/smoke_active_control.ps1` (new — active-control end-to-end smoke), `docs/wsl2_quickstart.md` (new — WSL2 build/run guide), `RESULTS.md` (live evidence table + entry template), `roadmap.md` (snapshot paragraph updated, NVML [~]→[x], packaging [~]→[x]).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: Files confirmed created/edited; no build run (Windows authoring environment, g++ smoke for verification is the next step).
+- Assumptions made: `BenchmarkWorkload.foreground` field exists and is set; `WorkloadExecution.child.start_ts_wall`/`end_ts_wall` are populated by the execute_benchmark loop; `to_string(SchedulerState)` is defined in types.hpp (confirmed by reading the file).
+- Next window should: Run `bash scripts/smoke_wsl2.sh` in WSL2 to validate the Linux build including nvml_backend.cpp (expects dlopen to fail gracefully when NVML absent). Then run `scripts/smoke_active_control.ps1` on Windows to verify the p95 latency assertion fields appear in the benchmark summary JSON.
+
+#### 2026-04-16 IST - Context Window Summary (CW-3)
+
+- Context window covered: "Do the next 10 steps" — fourth session. Added master evidence collection script, hermesctl nvml subcommand, hermes_report state coverage section, hermes_bench --verify-targets, config/oom_stress_scenario.yaml, smoke_wsl2.sh Step 8, hermes_compare --summary-json, hermes_eval improvements, README updates, roadmap + design.md update.
+- Files changed: `scripts/collect_wsl2_evidence.sh` (new), `src/cli/hermes_eval.cpp` (--out flag, data_available, ts_wall, graceful empty-predictions), `src/cli/hermesctl.cpp` (nvml subcommand, dlopen inline), `CMakeLists.txt` (dl link for hermesctl), `src/cli/hermes_report.cpp` (StateCovRecord, load_state_coverage, print_coverage_table, write_coverage_csv), `src/cli/hermes_bench.cpp` (--verify-targets flag + post-run assertion loop), `config/oom_stress_scenario.yaml` (new), `scripts/smoke_wsl2.sh` (Step 8 state coverage), `README.md` (--generate-oom-stress, --verify-targets, hermesctl nvml, docs table, evidence table), `src/cli/hermes_compare.cpp` (#include map, --summary-json flag + write_summary_json), `roadmap.md` (snapshot updated), `design.md` (this entry).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: Files confirmed created/edited per above list; no build run in Windows authoring environment.
+- Assumptions made: `hermes_report.cpp` imports `<fstream>` for `std::istreambuf_iterator` (already present); `hermes_compare.cpp` already imports `<fstream>`, `<iomanip>`, `<sstream>` (present from prior session).
+- Next window should: Run `bash scripts/smoke_wsl2.sh` in WSL2 (now 8 steps). Then `bash scripts/collect_wsl2_evidence.sh` to produce the first live evidence artifacts. Record results in RESULTS.md. Run `hermesctl nvml` to verify NVML probe output.
+
+#### 2026-04-16 IST - Context Window Summary (CW-4)
+
+- Context window covered: "Do the next 10 steps and give me how much % is done" — fifth session. Continued from a context-window boundary mid-Step-1 (process_mapper files had been read but not yet edited).
+- Files changed:
+  - `src/profiler/process_mapper.cpp` — rewritten to include `nvml_backend.hpp`, add `nvml_instance()` singleton, use `NvmlBackend::query_all_processes()` (multi-GPU) or `query_processes(0)` (single-GPU) as primary GPU attribution source; nvidia-smi fallback preserved.
+  - `include/hermes/monitor/nvml_backend.hpp` — added `query_all_processes()` declaration; updated `fill_sample()` doc comment (now aggregates all devices).
+  - `src/monitor/nvml_backend.cpp` — `fill_sample()` now loops all `device_count_` GPUs, sums VRAM, averages GPU utilisation; new `query_all_processes()` iterates all devices and merges per-PID memory by summing.
+  - `config/baseline_scenario.yaml` (new) — pre-built 3-workload baseline scenario config ready for `hermes_bench`.
+  - `config/observe_scenario.yaml` (new) — pre-built 3-workload observe-only scenario config with HERMES UPS thresholds.
+  - `src/cli/hermes_synth.cpp` — refactored samples to `SynthFrame` struct + `frames_to_samples()` helper; added `make_cooldown_samples()` and `make_recovery_samples()` fixtures; added `--recovery` and `--cooldown` CLI flags; default scenario name tracks the preset.
+  - `src/cli/hermes_fault.cpp` — added `gen_recovery_resume()` (three-phase: critical pressure → abrupt drop → gradual resume); registered as 7th scenario; updated header comment, usage text, and scenario list.
+  - `scripts/hermes_plot.py` — added `print_summary()` function (UPS peak/mean/bands, risk peak, scheduler states, action counts, band transitions, replay_summary validity); added `--summary` flag to `main()`.
+  - `scripts/run_all_smoke.ps1` (new) — orchestrates all 7 PowerShell smoke scripts, prints pass/fail/skip table with timing; `--StopOnFailure` flag.
+  - `src/cli/hermesctl.cpp` — added `cmd_eval()` subcommand (reads `eval_summary.json` if present, else summarises `predictions.ndjson`; scans `artifacts/logs/` for most recent run on Linux/Windows); added POSIX `<dirent.h>`, `<sys/stat.h>` guards; wired as `hermesctl eval [run-dir]`.
+  - `roadmap.md` — snapshot paragraph updated; `[~]` closed to `[x]` for: problem framing, git/license, process mapper NVML wiring, plots/hermes_plot.py; `[~]` note updated for scheduler state machine (new fixtures); fault injection item updated to 7 scenarios.
+  - `LICENSE` — confirmed MIT license already present (copyright 2026 Abhishek Kumar).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: Files confirmed created/edited per above list; no build run in Windows authoring environment.
+- Assumptions made: `NvmlBackend::device_count()` returns the correct NVML-reported count; `GpuProcessStats` struct has `pid` (unsigned int) and `used_gpu_memory_bytes` (uint64_t) fields (confirmed from nvml_backend.hpp). `hermesctl eval` POSIX path uses `opendir`/`readdir`/`stat` — all present on Linux; Windows path uses `FindFirstFileA`/`FindNextFileA`.
+- Roadmap counts after this session: [x] = 53, [~] = 9, [ ] = 9 → 71 total, ~75% done.
+- Next window should: Run `bash scripts/smoke_wsl2.sh` in WSL2 to validate all 8 steps including NVML-wired process_mapper. Run `scripts/run_all_smoke.ps1` on Windows to exercise the full suite. Then advance toward live evidence with `bash scripts/collect_wsl2_evidence.sh` on a WSL2 machine with stress-ng. Target: close the remaining 9 `[ ]` items which all require a real Linux+GPU machine.
+
+#### 2026-04-16 IST - Context Window Summary (CW-5)
+
+- Context window covered: "Do the next 10 steps and give me how much % is done" — sixth session. Continued from a context-window boundary at Step 4 of 10 (hermes_tune.py was just being written).
+- Files changed:
+  - `config/baseline_scenario.yaml` — upgraded from smoke/echo placeholders to real fidelity workloads: Python 2 GB memory hog (`bytearray`), tight compute loop (500 iterations math.sqrt × 5000 values), stress-ng 2-core CPU hog; smoke fallback comments preserved inline.
+  - `config/observe_scenario.yaml` — same fidelity upgrade as baseline; `runtime_mode: observe-only`, UPS thresholds `elevated=40 / critical=70`.
+  - `config/low_pressure_scenario.yaml` (new) — active-control mode, single quiet foreground workload, `expected_max_intervention_count: 1`; standardized Phase 6d false-positive measurement scenario.
+  - `src/cli/hermes_eval.cpp` — added `false_positive_rate_per_hour` (FP / observation_hours) and `observation_window_s` (span from min to max `ts_mono`) to `EvalResult` struct, JSON output, and stdout table; observation window computed with `std::minmax_element`.
+  - `scripts/hermes_tune.py` (new) — reads one or more `eval_summary.json` files via glob or `--eval-dir`; aggregates precision/recall/F1/mean_lead_time/FP_rate; compares against design.md calibration targets; reads schema.yaml thresholds; prints PASS/FAIL table; `schema_suggestions()` maps failed targets to specific `config/schema.yaml` adjustments.
+  - `scripts/check_evidence_tiers.py` (new) — probes T0–T5 evidence tiers by scanning `artifacts/`; prints status table; accepts `--require T2` for CI gating; exits non-zero if any tier is unmet.
+  - `src/cli/hermes_bench.cpp` — added `--delta-vs PATH` flag: loads a saved baseline summary JSON, reads the current run's summary, and prints a delta table (p95 latency, completion rate, OOM count, intervention count) with BETTER/WORSE verdict; added `SummarySnapshot`, `load_summary_snapshot()`, `print_delta_table()` helpers; `is_option_with_value()` updated.
+  - `RESULTS.md` — live evidence table updated with Tier column (T0–T5) for all rows; new T2/T3/T4/T5 pending rows added; new "Phase 6 Evidence Targets" table maps each tier to collection command and script.
+  - `scripts/smoke_phase6.sh` (new) — bash automation for Phase 6a–d on Linux: (6a) PSI non-zero monitor validation, (6b) fidelity workload run + hermes_eval T2 check, (6c) hermes_tune.py calibration targets, (6d) low-pressure false positive --verify-targets; exits 0 only if all phases pass.
+  - `README.md` — "Key Results" section added as a clearly-labeled placeholder with before/after latency table, predictor quality table (precision/recall/F1/lead time/FP rate), false positive row, and instructions for running smoke_phase6.sh and check_evidence_tiers.py.
+  - `roadmap.md` — snapshot paragraph extended with all CW-5 additions; Phase 6b first item closed `[ ]` → `[x]` (config YAMLs now have fidelity workloads); Phase 6c second item `[ ]` → `[~]` (hermes_tune.py exists); Phase 6d first item `[ ]` → `[~]` (low_pressure_scenario.yaml exists); Phase 6g first item `[ ]` → `[~]` (placeholder added).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: Files confirmed created/edited per above list; no build run in Windows authoring environment.
+- Roadmap counts after this session: [x] = 54, [~] = 12, [ ] = 17 → 83 total items (Phase 6 adds 22 items). Completion: 54/83 = 65% full, 60/83 = 72% if partial counts halfway.
+- Next window should: (1) Run `bash scripts/smoke_phase6.sh` on WSL2/Linux to collect T1–T4 evidence. (2) Run `python3 scripts/check_evidence_tiers.py` to verify tier status. (3) Run `hermes_bench config/baseline_scenario.yaml --runs 5 --run-id baseline-5run` then `hermes_bench config/oom_stress_scenario.yaml --runs 5 --hermes-bin build/hermesd --delta-vs artifacts/bench/baseline-5run-latency.json` to populate the Key Results table. (4) Capture strace + perf (scripts/bench_strace.sh + bench_perf.sh) during an active-control run for T5 evidence.

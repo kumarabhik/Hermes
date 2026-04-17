@@ -126,6 +126,9 @@ add_executable(hermes_pack src/cli/hermes_pack.cpp)
 # Human-readable Markdown run journal (standalone)
 add_executable(hermes_journal src/cli/hermes_journal.cpp)
 
+# Standalone UPS calculator and score explainer (standalone)
+add_executable(hermes_score src/cli/hermes_score.cpp)
+
 # ---------------------------------------------------------------------------
 # Install targets
 # ---------------------------------------------------------------------------
@@ -152,6 +155,7 @@ install(TARGETS
     hermes_watchdog
     hermes_pack
     hermes_journal
+    hermes_score
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

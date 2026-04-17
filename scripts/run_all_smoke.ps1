@@ -30,7 +30,8 @@ $Smokes = @(
     @{ Name = "active-control";      Script = "smoke_active_control.ps1" },
     @{ Name = "simulate";            Script = "smoke_simulate.ps1" },
     @{ Name = "web-dashboard";       Script = "smoke_web.ps1" },
-    @{ Name = "pack-journal";        Script = "smoke_pack.ps1" }
+    @{ Name = "pack-journal";        Script = "smoke_pack.ps1" },
+    @{ Name = "all-states";          Script = "smoke_all_states.ps1" }
 )
 
 $Results = @()

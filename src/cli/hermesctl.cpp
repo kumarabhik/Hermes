@@ -1146,6 +1146,140 @@ int cmd_logs(const std::vector<std::string>& args, const std::string& artifact_r
     return 0;
 }
 
+// ---- summary subcommand: one-screen overview of the most recent run ----
+//
+// Reads the most recent run directory under artifacts/logs/ and prints a
+// compact summary: run_id, host, time span, peak UPS, band, actions taken,
+// top signal, and the last few events.
+
+int cmd_summary(const std::string& artifact_root) {
+    const std::string logs_dir = artifact_root + "/logs";
+
+    // Find most recent run directory.
+    std::string latest_dir;
+    std::string latest_run_id;
+    {
+#ifdef _WIN32
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((logs_dir + "\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            std::cerr << "No runs found in " << logs_dir << "\n";
+            return 1;
+        }
+        FILETIME best_ft{};
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == '.') continue;
+            if (CompareFileTime(&fd.ftLastWriteTime, &best_ft) > 0) {
+                best_ft = fd.ftLastWriteTime;
+                latest_dir = logs_dir + "/" + fd.cFileName;
+                latest_run_id = fd.cFileName;
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+#else
+        DIR* d = opendir(logs_dir.c_str());
+        if (!d) { std::cerr << "No runs found in " << logs_dir << "\n"; return 1; }
+        struct dirent* ent;
+        struct stat best_st{};
+        while ((ent = readdir(d)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            const std::string fp = logs_dir + "/" + ent->d_name;
+            struct stat st{};
+            if (stat(fp.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            if (st.st_mtime > best_st.st_mtime) {
+                best_st = st;
+                latest_dir = fp;
+                latest_run_id = ent->d_name;
+            }
+        }
+        closedir(d);
+#endif
+    }
+
+    if (latest_dir.empty()) {
+        std::cerr << "No run directories found under " << logs_dir << "\n";
+        return 1;
+    }
+
+    // Read replay_summary.json for quick metrics.
+    auto jstr = [](const std::string& json, const std::string& key) -> std::string {
+        const std::string kk = "\"" + key + "\"";
+        auto p = json.find(kk);
+        if (p == std::string::npos) return "";
+        p = json.find(':', p + kk.size());
+        if (p == std::string::npos) return "";
+        ++p;
+        while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+        if (p >= json.size()) return "";
+        if (json[p] == '"') {
+            auto e = json.find('"', p + 1);
+            return e == std::string::npos ? "" : json.substr(p + 1, e - p - 1);
+        }
+        auto e = p;
+        while (e < json.size() && json[e] != ',' && json[e] != '}' && json[e] != '\n') ++e;
+        std::string v = json.substr(p, e - p);
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
+        return v;
+    };
+
+    std::string summary_json;
+    {
+        std::ifstream f(latest_dir + "/replay_summary.json");
+        if (f.is_open()) {
+            std::ostringstream ss; ss << f.rdbuf();
+            summary_json = ss.str();
+        }
+    }
+
+    // Read run_metadata.json for host/start_time.
+    std::string meta_json;
+    {
+        std::ifstream f(latest_dir + "/run_metadata.json");
+        if (f.is_open()) { std::ostringstream ss; ss << f.rdbuf(); meta_json = ss.str(); }
+    }
+
+    // Count actions.ndjson lines.
+    std::size_t action_count = 0;
+    {
+        std::ifstream f(latest_dir + "/actions.ndjson");
+        std::string ln;
+        while (std::getline(f, ln)) if (!ln.empty()) ++action_count;
+    }
+
+    // Tail last 5 events from events.ndjson.
+    std::vector<std::string> tail_events;
+    {
+        std::ifstream f(latest_dir + "/events.ndjson");
+        std::string ln;
+        while (std::getline(f, ln)) if (!ln.empty()) tail_events.push_back(ln);
+        if (tail_events.size() > 5) tail_events.erase(tail_events.begin(), tail_events.end() - 5);
+    }
+
+    const std::string sep(60, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl summary — most recent run\n";
+    std::cout << sep << "\n";
+    std::cout << std::left << std::setw(20) << "Run ID"      << (latest_run_id.empty() ? jstr(summary_json, "run_id") : latest_run_id) << "\n";
+    std::cout << std::left << std::setw(20) << "Host"        << jstr(meta_json,    "host") << "\n";
+    std::cout << std::left << std::setw(20) << "Start time"  << jstr(meta_json,    "start_time") << "\n";
+    std::cout << std::left << std::setw(20) << "Peak UPS"    << jstr(summary_json, "peak_ups") << "\n";
+    std::cout << std::left << std::setw(20) << "Peak risk"   << jstr(summary_json, "peak_risk_score") << "\n";
+    std::cout << std::left << std::setw(20) << "Samples"     << jstr(summary_json, "samples") << "\n";
+    std::cout << std::left << std::setw(20) << "Actions"     << action_count << "\n";
+    std::cout << std::left << std::setw(20) << "Valid"       << jstr(summary_json, "valid") << "\n";
+    std::cout << "\nRecent events:\n";
+    if (tail_events.empty()) {
+        std::cout << "  (none)\n";
+    } else {
+        for (const auto& ev : tail_events) {
+            std::cout << "  " << ev.substr(0, 100) << (ev.size() > 100 ? "..." : "") << "\n";
+        }
+    }
+    std::cout << sep << "\n";
+    return 0;
+}
+
 // ---- watch subcommand: streaming timestamped status feed ----
 //
 // Prints one line per interval with timestamp, UPS, band, state, and risk.
@@ -1562,6 +1696,10 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "headroom") {
         return cmd_headroom(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "summary") {
+        return cmd_summary(artifact_root);
     }
 
     if (!args.empty() && args[0] == "watch") {

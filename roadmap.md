@@ -145,6 +145,10 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] Runtime run metadata and config snapshot artifacts are written for daemon runs.
 - [x] Runtime telemetry-quality artifacts are written for daemon runs.
 - [x] Synthetic replay, one-loop daemon replay, benchmark plan, benchmark launch, and benchmark-plus-Hermes smoke scripts exist for local `g++` verification.
+- [x] `CHANGELOG.md` documents all significant additions across CW-1 through CW-13 with per-release sections.
+- [x] `scripts/hermes_quickstart.sh` provides a one-command Linux T0/T1 setup check: verifies prerequisites, builds, runs synthetic + daemon smoke, checks PSI availability, and prints a T0–T5 readiness checklist.
+- [x] `scripts/smoke_pack.ps1` smoke test covers hermes_pack bundle creation, `--list` dry-run, `--generate-manifest`, and hermes_journal `--stdout`.
+- [x] `scripts/smoke_all_states.ps1` smoke test verifies `hermes_synth --all-states` produces samples with all 3 pressure bands and that `hermes_replay` summarizes without errors.
 
 ## Phase 1: Observability and Attribution
 
@@ -169,6 +173,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] Predictor computes VRAM growth slopes, memory pressure trends, and headroom collapse indicators.
 - [x] Predictor emits structured risk records with reason codes, lead time, and recommended actions.
 - [x] Offline evaluator (`hermes_eval`) measures predictor precision, recall, F1, mean lead time, true/false positives and false negatives from captured `predictions.ndjson` and `events.ndjson` artifacts; output written to `eval_summary.json`.
+- [x] `hermes_score` standalone CLI computes UPS from raw signal values and explains each component's weighted contribution; supports `--from-sample <ndjson>`, `--json`, and `--config`; exit codes encode the pressure band (0=normal, 1=elevated, 2=critical).
 
 ## Phase 3: Intervention Engine
 
@@ -180,6 +185,7 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [x] Level 3 hard-control path (`KillAction`) sends SIGTERM or SIGKILL to terminate an eligible candidate after guardrail checks (PID <= 1, Hermes own PID, protected-pids list, protected name patterns); compile-guarded for Linux.
 - [x] Dry-run, advisory, and active-control modes all execute through the same decision path via `ActiveExecutor`; mode selected by `HERMES_RUNTIME_MODE` environment variable; dry-run is default; active mutation is available on Linux.
 - [x] Every action emits a structured rationale, result, and `reversal_condition` field through NDJSON artifacts; reversal conditions describe the exact pressure/cycle conditions required before an action should or can be undone.
+- [x] `hermes_synth --all-states` preset generates a deterministic 16-frame fixture exercising all 5 scheduler states (Normal → Elevated → Throttled → Cooldown → Recovery → Normal) and all 3 intervention levels in a single run; designed for state-transition coverage testing.
 
 ## Phase 4: Benchmark Harness and Evaluation
 
@@ -201,6 +207,12 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [ ] At least one controlled failure is analyzed with `gdb`, including a saved backtrace or core-dump note.
 - [ ] Optional eBPF traces are aligned with PSI, VRAM, UPS, and intervention events when kernel tracing is enabled.
 - [x] README-ready before/after claims are derived from generated artifacts rather than manual interpretation: `scripts/populate_readme_results.py` reads bench + eval artifacts and rewrites the Key Results tables in README.md in place.
+- [x] `scripts/hermes_ci_gate.py` provides machine-readable T0–T5 CI gating; reads artifact directory and exits non-zero if the required tier is unmet; `--require`, `--json`, and `--all` flags.
+- [x] `scripts/hermes_coverage.py` generates a state-transition coverage matrix from `state_coverage.json` and `events.ndjson` files across all run directories; supports `--json` output and per-run breakdown with gap analysis.
+- [x] `config/scenario_multimodel.yaml` pre-built multi-model inference+training scenario: inference server foreground + training job (1.5 GB) + batch feature extractor + stale model replica; 120s, 3 runs, p95=8000ms.
+- [x] `config/scenario_low_memory.yaml` CPU+RAM stress scenario (no GPU required): foreground CPU compute + 512 MB and 1 GB RAM hogs + CPU background hog; 90s, 3 runs, p95=6000ms; primary scenario for Tier A/B testing without GPU.
+- [x] `hermes_replay --generate-manifest` auto-generates `scenario_manifest.json` from observed peaks and state distributions; floors values at 80% of observed to tolerate minor noise; makes any run a regression baseline.
+- [x] `hermes_replay --diff <baseline>` compares two run directories side-by-side with peak UPS, risk, action counts, and state/action distribution deltas with BETTER/WORSE verdicts.
 
 ## Phase 5: Operator UX, Replay, and Documentation
 
@@ -213,6 +225,14 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - [ ] Extended defensibility package exists: native collector, replay evidence, and one kernel-observability or `gdb` artifact are present for advanced claims.
 - [x] README summarizes achieved outcomes with links to smoke script artifacts and lists what is not yet evidenced (`README.md` Achieved Outcomes section).
 - [x] Tuning guide explains how to adjust UPS weights, thresholds, cooldowns, and protection rules safely (`docs/tuning_guide.md`).
+- [x] `hermes_pack` CLI packages a run directory into a portable evidence bundle; writes `bundle_manifest.json` with FNV-1a hashes and file sizes for all standard artifacts; supports `--output-dir` and `--list` (dry-run); standalone binary.
+- [x] `hermes_journal` CLI generates a human-readable Markdown timeline of a run from NDJSON artifacts; shows band transitions, scheduler state changes, high-risk predictions, decisions, and actions; `--stdout` and `--output` flags; standalone binary.
+- [x] `hermesctl watch` streams a timestamped one-line-per-interval status feed (UPS, band, state, risk) without clearing the screen; supports `--count N` for bounded output; designed for piping or file logging.
+- [x] `hermesctl history` scans `artifacts/logs/` and prints a table of all past runs with run_id, date, peak UPS, sample count, action count, and validity — newest first.
+- [x] `hermesctl logs` prints the last N events from `events.ndjson` in human-readable form; decodes band/state transitions and action events; `--tail N` and explicit run-dir argument.
+- [x] `hermesctl summary` prints a one-screen overview of the most recent run: run_id, host, start time, peak UPS/risk, sample/action counts, validity, and last 5 events.
+- [x] `docs/faq.md` operator FAQ covering UPS formula, Tier A/B/C configs, circuit breaker, active-control mode, evidence tiers, and troubleshooting steps.
+- [x] `scripts/hermes_status.sh` operational quick-check for Linux: daemon running, socket health, latest run artifacts, PSI availability, NVML/nvidia-smi status, and binary inventory.
 
 ## Phase 6: Performance Evidence and Claim Validation
 

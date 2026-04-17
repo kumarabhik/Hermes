@@ -14,85 +14,85 @@ scheduling problem and intervenes with layered controls before an OOM event occu
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            HERMES DAEMON (hermesd / hermesd_mt)             │
 │                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                        MONITOR LAYER                                  │  │
-│  │                                                                       │  │
-│  │  /proc/pressure/cpu  ──► CpuPsiMonitor   ─┐                          │  │
-│  │  /proc/pressure/mem  ──► MemPsiMonitor   ─┤                          │  │
-│  │  /proc/pressure/io   ──► IoPsiMonitor    ─┤                          │  │
-│  │  /proc/vmstat        ──► VmstatMonitor   ─┤──► PressureSample        │  │
-│  │  /proc/loadavg       ──► LoadavgMonitor  ─┤    (ts_wall, ts_mono,    │  │
-│  │  nvidia-smi / NVML   ──► GpuStatsCollect─┤     psi fields,          │  │
-│  │  /proc/<pid>/stat    ──► ProcStatParser  ─┘     vram_used_mb, …)     │  │
-│  │  /proc/<pid>/status  ──► RichProcReader                               │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                        MONITOR LAYER                                 │   │
+│  │                                                                      │   │
+│  │  /proc/pressure/cpu  ──► CpuPsiMonitor   ─┐                          │   │
+│  │  /proc/pressure/mem  ──► MemPsiMonitor   ─┤                          │   │
+│  │  /proc/pressure/io   ──► IoPsiMonitor    ─┤                          │   │
+│  │  /proc/vmstat        ──► VmstatMonitor   ─┤──► PressureSample        │   │
+│  │  /proc/loadavg       ──► LoadavgMonitor  ─┤    (ts_wall, ts_mono,    │   │
+│  │  nvidia-smi / NVML   ──► GpuStatsCollect─┤     psi fields,           │   │
+│  │  /proc/<pid>/stat    ──► ProcStatParser  ─┘     vram_used_mb, …)     │   │
+│  │  /proc/<pid>/status  ──► RichProcReader                              │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
 │                          │                                                  │
 │                          ▼                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                       PROFILER LAYER                                  │  │
-│  │                                                                       │  │
-│  │  NvmlBackend (dlopen) ──► query_all_processes() ─┐                   │  │
-│  │  nvidia-smi fallback  ──────────────────────────►│                   │  │
-│  │                                                   │                   │  │
-│  │  ProcessMapper ◄──────────────────────────────────┘                  │  │
-│  │    • Merges /proc PID metadata with GPU-per-PID attribution          │  │
-│  │    • WorkloadClassifier labels: training / inference / background    │  │
-│  │    • Marks foreground and protected PIDs                             │  │
-│  │    • Emits: ProcessSnapshot[] → processes.ndjson                     │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                       PROFILER LAYER                                 │   │
+│  │                                                                      │   │
+│  │  NvmlBackend (dlopen) ──► query_all_processes() ─┐                   │   │
+│  │  nvidia-smi fallback  ──────────────────────────►│                   │   │
+│  │                                                   │                  │   │
+│  │  ProcessMapper ◄──────────────────────────────────┘                  │   │
+│  │    • Merges /proc PID metadata with GPU-per-PID attribution          │   │
+│  │    • WorkloadClassifier labels: training / inference / background    │   │
+│  │    • Marks foreground and protected PIDs                             │   │
+│  │    • Emits: ProcessSnapshot[] → processes.ndjson                     │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │ 
 │                          │                                                  │
 │                          ▼                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                        ENGINE LAYER                                   │  │
 │  │                                                                       │  │
-│  │  PressureScoreCalculator                                             │  │
-│  │    • Normalises PSI + GPU + VRAM into weighted UPS (0-100)           │  │
-│  │    • Tracks band transitions (normal / elevated / critical)          │  │
-│  │    • Emits: PressureScore → scores.ndjson, events.ndjson             │  │
+│  │  PressureScoreCalculator                                             │   │
+│  │    • Normalises PSI + GPU + VRAM into weighted UPS (0-100)           │   │
+│  │    • Tracks band transitions (normal / elevated / critical)          │   │
+│  │    • Emits: PressureScore → scores.ndjson, events.ndjson             │   │
 │  │                          │                                            │  │
 │  │                          ▼                                            │  │
-│  │  OomPredictor                                                        │  │
-│  │    • Dual-window VRAM slopes (3 s fast + 10 s medium)                │  │
-│  │    • 4 sustained pressure residency counters                         │  │
-│  │    • Per-PID GPU growth tracking across windows                      │  │
-│  │    • Emits: RiskPrediction → predictions.ndjson                      │  │
-│  │             (risk_score, risk_band, lead_time_s, reason_codes)       │  │
+│  │  OomPredictor                                                        │   │
+│  │    • Dual-window VRAM slopes (3 s fast + 10 s medium)                │   │
+│  │    • 4 sustained pressure residency counters                         │   │
+│  │    • Per-PID GPU growth tracking across windows                      │   │
+│  │    • Emits: RiskPrediction → predictions.ndjson                      │   │
+│  │             (risk_score, risk_band, lead_time_s, reason_codes)       │   │
 │  │                          │                                            │  │
 │  │                          ▼                                            │  │
-│  │  Scheduler (state machine)                                           │  │
-│  │    States: Normal ─► Elevated ─► Throttled ─► Cooldown ─► Recovery  │  │
+│  │  Scheduler (state machine)                                           │   │
+│  │    States: Normal ─► Elevated ─► Throttled ─► Cooldown ─► Recovery  │    │
 │  │    • Combines UPS band + risk band + workload class + cooldowns       │  │
-│  │    • Circuit breaker: ≥4 L2/L3 actions in 60 s → forced cooldown     │  │
-│  │    • Emits: InterventionDecision → decisions.ndjson                  │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  │    • Circuit breaker: ≥4 L2/L3 actions in 60 s → forced cooldown     │   │
+│  │    • Emits: InterventionDecision → decisions.ndjson                  │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
 │                          │                                                  │
 │                          ▼                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                        ACTION LAYER                                   │  │
 │  │                                                                       │  │
 │  │  ActiveExecutor (mode dispatch)                                       │  │
 │  │    ├── observe-only  ──► DryRunExecutor (log only, no mutation)       │  │
 │  │    ├── advisory      ──► DryRunExecutor + advisory log                │  │
 │  │    └── active-control                                                 │  │
-│  │         ├── Level 1: ReprioritizeAction (setpriority / nice)         │  │
+│  │         ├── Level 1: ReprioritizeAction (setpriority / nice)         │   │
 │  │         ├── Level 2: ThrottleAction (SIGSTOP / SIGCONT)               │  │
-│  │         │           CgroupV2Backend (cpu.max, memory.high, cpuset)   │  │
-│  │         └── Level 3: KillAction (SIGTERM / SIGKILL)                  │  │
-│  │                      sort_by_placement() for multi-GPU targeting     │  │
-│  │    Emits: InterventionResult → actions.ndjson                        │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  │         │           CgroupV2Backend (cpu.max, memory.high, cpuset)   │   │
+│  │         └── Level 3: KillAction (SIGTERM / SIGKILL)                  │   │
+│  │                      sort_by_placement() for multi-GPU targeting     │   │
+│  │    Emits: InterventionResult → actions.ndjson                        │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
 │                          │                                                  │
 │                          ▼                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                        RUNTIME LAYER                                  │  │
 │  │                                                                       │  │
-│  │  EventLogger     → per-run NDJSON artifact set (see below)           │  │
-│  │  RunMetadata     → run_metadata.json                                 │  │
-│  │  TelemetryQuality→ telemetry_quality.json                            │  │
-│  │  LatencyProbe    → latency_summary.json (p50/p95/p99/max loop time)  │  │
-│  │  ControlSocket   → Unix domain socket → hermesctl / hermes_web       │  │
+│  │  EventLogger     → per-run NDJSON artifact set (see below)           │   │
+│  │  RunMetadata     → run_metadata.json                                 │   │
+│  │  TelemetryQuality→ telemetry_quality.json                            │   │
+│  │  LatencyProbe    → latency_summary.json (p50/p95/p99/max loop time)  │   │
+│  │  ControlSocket   → Unix domain socket → hermesctl / hermes_web       │   │
 │  │  EventBus<T>     → bounded MPSC ring buffer (hermesd_mt sampler↔policy)│ │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 

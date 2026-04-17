@@ -210,6 +210,15 @@ hermesctl nvml
 | `hermes_replay --generate-manifest` | Auto-generates `scenario_manifest.json` from observed peaks/states/actions to lock in a run as a regression baseline |
 | `scripts/hermes_quickstart.sh` | One-command Linux T0/T1 evidence setup: builds, smokes, checks PSI, prints readiness checklist |
 | `config/scenario_multimodel.yaml` | Pre-built multi-model serving scenario: inference server + training job + batch ETL + stale replica |
+| `hermes_journal` | Generates a Markdown timeline of a run (band transitions, state changes, decisions, actions); writes `journal.md` |
+| `hermesctl history` | Table of all runs in `artifacts/logs/` — run_id, date, peak UPS, samples, actions, validity |
+| `hermesctl logs` | Tail recent events from the latest run in human-readable format |
+| `hermes_synth --all-states` | Comprehensive preset: all 5 scheduler states + all 3 intervention levels in one run |
+| `hermes_replay --diff <dir>` | Side-by-side comparison of two run replay summaries with BETTER/WORSE verdicts |
+| `scripts/hermes_status.sh` | Linux operational quick-check: daemon, socket, artifacts, PSI, GPU, binaries |
+| `config/scenario_low_memory.yaml` | CPU + RAM pressure scenario (no GPU): foreground compute + RAM hogs |
+| `scripts/hermes_ci_gate.py` | CI evidence tier gate (T0–T5); exits non-zero if required tier is not met |
+| `docs/faq.md` | Operator FAQ: UPS, Tiers, circuit breaker, active-control, evidence tiers, troubleshooting |
 
 **Circuit breaker** (in `Scheduler`): when ≥ `max_interventions_per_window` Level-2/3 actions fire within `window_ms`, the scheduler enters a forced cooldown for `forced_cooldown_ms` to prevent cascading kill storms. Configurable in `schema_tier_c.yaml` under `circuit_breaker:`.
 

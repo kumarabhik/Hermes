@@ -123,6 +123,9 @@ add_executable(hermes_watchdog src/cli/hermes_watchdog.cpp)
 # Evidence bundle packager (standalone — no hermes_core needed)
 add_executable(hermes_pack src/cli/hermes_pack.cpp)
 
+# Human-readable Markdown run journal (standalone)
+add_executable(hermes_journal src/cli/hermes_journal.cpp)
+
 # ---------------------------------------------------------------------------
 # Install targets
 # ---------------------------------------------------------------------------
@@ -148,6 +151,7 @@ install(TARGETS
     hermes_annotate
     hermes_watchdog
     hermes_pack
+    hermes_journal
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

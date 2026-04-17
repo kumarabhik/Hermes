@@ -1,0 +1,76 @@
+# scenario_low_memory.yaml — CPU + RAM pressure scenario (no GPU required).
+#
+# Exercises Hermes on Tier A/B hosts without a GPU.  The foreground workload is
+# a tight compute loop (simulates a CPU-bound inference or data processing task).
+# The background workloads apply steadily increasing RAM pressure, pushing
+# mem_some_avg10 above the UPS elevated threshold.
+#
+# This is the primary scenario for false-positive baseline checks on CPU-only
+# hosts and for validating Level-1 (reprioritize) and Level-2 (throttle)
+# interventions without GPU contention.
+#
+# Run:
+#   hermes_bench config/scenario_low_memory.yaml --runs 3
+#   hermes_bench config/scenario_low_memory.yaml --runs 5 \
+#       --hermes-bin build/hermesd --replay-bin build/hermes_replay \
+#       --verify-targets
+
+scenario_name: low_memory_pressure
+runtime_mode: active-control
+duration_s: 90
+runs: 3
+
+# Foreground: CPU-bound computation — should complete without interruption.
+latency_target_ms: 6000
+expected_max_oom_count: 0
+
+foreground:
+  name: cpu_compute_fg
+  command: >
+    python3 -c "
+    import math, time
+    for i in range(1500):
+        _ = [math.sqrt(x * 1.0001) for x in range(1000)]
+        time.sleep(0.05)
+    "
+  timeout_s: 95
+  expected_exit_code: 0
+
+# Background workloads apply RAM pressure in increasing waves.
+background:
+  # Wave 1: moderate RAM hold (~512 MB).
+  - name: ram_hog_small
+    command: >
+      python3 -c "
+      import time
+      buf = bytearray(512 * 1024 * 1024)
+      for i in range(90):
+          buf[i % len(buf)] = i % 256
+          time.sleep(1.0)
+      "
+    timeout_s: 95
+    expected_exit_code: 0
+
+  # Wave 2: larger RAM hold (~1 GB) — primary Level-2 throttle candidate.
+  - name: ram_hog_large
+    command: >
+      python3 -c "
+      import time
+      buf = bytearray(1024 * 1024 * 1024)
+      for i in range(80):
+          buf[i % len(buf)] = i % 256
+          time.sleep(1.0)
+      "
+    timeout_s: 95
+    expected_exit_code: 0
+
+  # Wave 3: background CPU hog — increases CPU PSI alongside memory pressure.
+  - name: cpu_hog_bg
+    command: >
+      python3 -c "
+      import math, time
+      for i in range(900):
+          _ = [math.sin(x * 0.001) + math.cos(x * 0.002) for x in range(2000)]
+      "
+    timeout_s: 95
+    expected_exit_code: 0

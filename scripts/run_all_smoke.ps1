@@ -29,7 +29,8 @@ $Smokes = @(
     @{ Name = "benchmark-compare";   Script = "smoke_benchmark_compare.ps1" },
     @{ Name = "active-control";      Script = "smoke_active_control.ps1" },
     @{ Name = "simulate";            Script = "smoke_simulate.ps1" },
-    @{ Name = "web-dashboard";       Script = "smoke_web.ps1" }
+    @{ Name = "web-dashboard";       Script = "smoke_web.ps1" },
+    @{ Name = "pack-journal";        Script = "smoke_pack.ps1" }
 )
 
 $Results = @()

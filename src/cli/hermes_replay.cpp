@@ -3,7 +3,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <set>
 #include <string>
 
 namespace {
@@ -29,7 +31,96 @@ void print_usage() {
               << "\n"
               << "Options:\n"
               << "  --generate-manifest   Auto-generate scenario_manifest.json from observed peaks/states/actions.\n"
-              << "                        Useful for locking in a known-good run as a regression baseline.\n";
+              << "                        Useful for locking in a known-good run as a regression baseline.\n"
+              << "  --diff <baseline-dir> Compare this run against a baseline run directory side-by-side.\n"
+              << "                        Prints peak UPS, risk, action counts, and state distribution deltas.\n";
+}
+
+// Compare two replay summaries side-by-side.
+void print_diff(const hermes::ReplaySummary& a, const hermes::ReplaySummary& b,
+                const std::string& label_a, const std::string& label_b) {
+    const std::string sep(72, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermes_replay --diff\n";
+    std::cout << sep << "\n";
+    std::cout << "  Baseline : " << label_a << "\n";
+    std::cout << "  Compare  : " << label_b << "\n\n";
+
+    auto row = [](const std::string& metric, double va, double vb, bool lower_is_better) {
+        const double delta = vb - va;
+        std::string verdict = "=";
+        if (std::abs(delta) > 0.001) {
+            const bool improved = lower_is_better ? delta < 0 : delta > 0;
+            verdict = improved ? "BETTER" : "WORSE";
+        }
+        std::cout << std::left  << std::setw(28) << metric
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(12) << va
+                  << std::setw(12) << vb
+                  << std::setw(10) << (delta >= 0 ? "+" : "") + std::to_string(static_cast<int>(delta * 100) / 100.0).substr(0, 7)
+                  << "  " << verdict << "\n";
+    };
+    auto row_cnt = [](const std::string& metric, std::size_t va, std::size_t vb, bool lower_is_better) {
+        const long delta = static_cast<long>(vb) - static_cast<long>(va);
+        std::string verdict = "=";
+        if (delta != 0) {
+            const bool improved = lower_is_better ? delta < 0 : delta > 0;
+            verdict = improved ? "BETTER" : "WORSE";
+        }
+        std::cout << std::left  << std::setw(28) << metric
+                  << std::right
+                  << std::setw(12) << va
+                  << std::setw(12) << vb
+                  << std::setw(10) << (delta >= 0 ? "+" : "") + std::to_string(delta)
+                  << "  " << verdict << "\n";
+    };
+
+    std::cout << std::left  << std::setw(28) << "Metric"
+              << std::right << std::setw(12) << "Baseline"
+              << std::setw(12) << "Compare"
+              << std::setw(10) << "Delta"
+              << "  Verdict\n";
+    std::cout << std::string(72, '-') << "\n";
+
+    row("peak_ups",           a.peak_ups,           b.peak_ups,           true);
+    row("peak_risk_score",    a.peak_risk_score,     b.peak_risk_score,    true);
+    row("peak_mem_full_avg10",a.peak_mem_full_avg10, b.peak_mem_full_avg10,true);
+    row("peak_gpu_util_pct",  a.peak_gpu_util_pct,   b.peak_gpu_util_pct,  true);
+    row_cnt("samples",        a.counts.samples,      b.counts.samples,     false);
+    row_cnt("predictions",    a.counts.predictions,  b.counts.predictions, false);
+    row_cnt("decisions",      a.counts.decisions,    b.counts.decisions,   false);
+    row_cnt("actions",        a.counts.actions,      b.counts.actions,     true);
+    row_cnt("parse_errors",   a.counts.parse_errors, b.counts.parse_errors,true);
+
+    // State distribution.
+    std::cout << "\nScheduler state distribution:\n";
+    std::set<std::string> all_states;
+    for (const auto& kv : a.scheduler_states) all_states.insert(kv.first);
+    for (const auto& kv : b.scheduler_states) all_states.insert(kv.first);
+    for (const auto& s : all_states) {
+        const std::size_t ca = a.scheduler_states.count(s) ? a.scheduler_states.at(s) : 0;
+        const std::size_t cb = b.scheduler_states.count(s) ? b.scheduler_states.at(s) : 0;
+        std::cout << "  " << std::left << std::setw(16) << s
+                  << "  baseline=" << ca << "  compare=" << cb << "\n";
+    }
+
+    // Action distribution.
+    std::cout << "\nAction distribution:\n";
+    std::set<std::string> all_actions;
+    for (const auto& kv : a.decision_actions) all_actions.insert(kv.first);
+    for (const auto& kv : b.decision_actions) all_actions.insert(kv.first);
+    if (all_actions.empty()) {
+        std::cout << "  (none)\n";
+    }
+    for (const auto& act : all_actions) {
+        const std::size_t ca = a.decision_actions.count(act) ? a.decision_actions.at(act) : 0;
+        const std::size_t cb = b.decision_actions.count(act) ? b.decision_actions.at(act) : 0;
+        std::cout << "  " << std::left << std::setw(24) << act
+                  << "  baseline=" << ca << "  compare=" << cb << "\n";
+    }
+
+    std::cout << sep << "\n";
+    std::cout << "  Verdict: BETTER/WORSE relative to baseline. = means no change.\n";
 }
 
 // Write a scenario_manifest.json derived from the replay summary.
@@ -113,6 +204,12 @@ int main(int argc, char** argv) {
 
     const bool generate_manifest = has_arg(argc, argv, "--generate-manifest");
 
+    // --diff <baseline-dir>: compare this run against a baseline.
+    std::string diff_baseline;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--diff") { diff_baseline = argv[i + 1]; break; }
+    }
+
     const std::filesystem::path run_directory = argv[1];
     // artifact-root is positional arg 2 only if it doesn't start with '--'
     std::filesystem::path artifact_root;
@@ -124,6 +221,17 @@ int main(int argc, char** argv) {
 
     hermes::ReplaySummaryBuilder builder;
     const hermes::ReplaySummary summary = builder.summarize(run_directory);
+
+    // --diff mode: summarize both runs and print comparison, then exit.
+    if (!diff_baseline.empty()) {
+        const std::filesystem::path baseline_dir = diff_baseline;
+        hermes::ReplaySummaryBuilder baseline_builder;
+        const hermes::ReplaySummary  baseline_summary = baseline_builder.summarize(baseline_dir);
+        print_diff(baseline_summary, summary,
+                   baseline_dir.filename().string(),
+                   run_directory.filename().string());
+        return 0;
+    }
 
     if (generate_manifest) {
         std::string merr;

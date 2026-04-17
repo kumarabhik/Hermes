@@ -894,6 +894,258 @@ int cmd_schema(const std::vector<std::string>& args, const std::string& /*artifa
     return 0;
 }
 
+// ---- history subcommand: table of all run directories ----
+//
+// Scans artifacts/logs/ and prints a table of every run with run_id, date,
+// peak UPS, action count, validity, and sample count.
+
+int cmd_history(const std::string& artifact_root) {
+    const std::string logs_dir = artifact_root + "/logs";
+
+    struct RunRow {
+        std::string run_id;
+        std::string date;
+        double      peak_ups{0.0};
+        std::size_t actions{0};
+        std::size_t samples{0};
+        bool        valid{false};
+        uint64_t    sort_key{0};
+    };
+
+    std::vector<RunRow> rows;
+
+    auto scan = [&](const std::string& dir_path) {
+#ifdef _WIN32
+        WIN32_FIND_DATAA ffd;
+        HANDLE h = FindFirstFileA((dir_path + "\\*").c_str(), &ffd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (ffd.cFileName[0] == '.') continue;
+            const std::string run_path = dir_path + "/" + ffd.cFileName;
+            ULARGE_INTEGER t; t.LowPart = ffd.ftLastWriteTime.dwLowDateTime;
+            t.HighPart = ffd.ftLastWriteTime.dwHighDateTime;
+            RunRow r;
+            r.sort_key = t.QuadPart;
+#else
+        DIR* dirp = opendir(dir_path.c_str());
+        if (!dirp) return;
+        struct dirent* ent;
+        while ((ent = readdir(dirp)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            const std::string run_path = dir_path + "/" + ent->d_name;
+            struct stat st{};
+            if (stat(run_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            RunRow r;
+            r.sort_key = static_cast<uint64_t>(st.st_mtime);
+#endif
+            // Read run_metadata.json.
+            std::ifstream mf(run_path + "/run_metadata.json");
+            if (mf.is_open()) {
+                const std::string j((std::istreambuf_iterator<char>(mf)),
+                                     std::istreambuf_iterator<char>());
+                r.run_id = jstr(j, "run_id");
+                const uint64_t ts = jull(j, "ts_wall");
+                if (ts > 0) {
+                    const std::time_t t2 = static_cast<std::time_t>(ts / 1000);
+                    char buf[24] = {};
+                    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", std::gmtime(&t2));
+                    r.date = buf;
+                }
+            }
+            if (r.run_id.empty()) {
+#ifdef _WIN32
+                r.run_id = ffd.cFileName;
+#else
+                r.run_id = ent->d_name;
+#endif
+            }
+
+            // Read peak_ups from telemetry_quality.json.
+            std::ifstream tq(run_path + "/telemetry_quality.json");
+            if (tq.is_open()) {
+                const std::string j((std::istreambuf_iterator<char>(tq)),
+                                     std::istreambuf_iterator<char>());
+                r.peak_ups = jdbl(j, "peak_ups");
+            }
+
+            // Count actions.
+            std::ifstream af(run_path + "/actions.ndjson");
+            if (af.is_open()) {
+                std::string l;
+                while (std::getline(af, l)) if (!l.empty()) ++r.actions;
+            }
+
+            // Count samples.
+            std::ifstream sf(run_path + "/samples.ndjson");
+            if (sf.is_open()) {
+                std::string l;
+                while (std::getline(sf, l)) if (!l.empty()) ++r.samples;
+            }
+
+            // Validity from replay_summary.json.
+            std::ifstream rs(run_path + "/replay_summary.json");
+            if (rs.is_open()) {
+                const std::string j((std::istreambuf_iterator<char>(rs)),
+                                     std::istreambuf_iterator<char>());
+                r.valid = (j.find("\"valid\":true") != std::string::npos);
+            }
+
+            rows.push_back(r);
+#ifdef _WIN32
+        } while (FindNextFileA(h, &ffd));
+        FindClose(h);
+#else
+        }
+        closedir(dirp);
+#endif
+    };
+
+    scan(logs_dir);
+    std::sort(rows.begin(), rows.end(), [](const RunRow& a, const RunRow& b) {
+        return a.sort_key > b.sort_key;  // newest first
+    });
+
+    const std::string sep(80, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl history — run log\n";
+    std::cout << sep << "\n";
+    if (rows.empty()) {
+        std::cout << "  No runs found in " << logs_dir << "\n";
+        std::cout << "  Run hermesd to create a run, or hermes_synth to generate a synthetic fixture.\n";
+        return 0;
+    }
+    std::cout << std::left
+              << std::setw(36) << "Run ID"
+              << std::setw(18) << "Date (UTC)"
+              << std::setw(10) << "Peak UPS"
+              << std::setw(10) << "Samples"
+              << std::setw(10) << "Actions"
+              << "Valid\n";
+    std::cout << std::string(80, '-') << "\n";
+    std::cout << std::fixed << std::setprecision(1);
+    for (const auto& r : rows) {
+        std::cout << std::left
+                  << std::setw(36) << r.run_id.substr(0, 35)
+                  << std::setw(18) << (r.date.empty() ? "—" : r.date)
+                  << std::setw(10) << r.peak_ups
+                  << std::setw(10) << r.samples
+                  << std::setw(10) << r.actions
+                  << (r.valid ? "yes" : "—") << "\n";
+    }
+    std::cout << sep << "\n";
+    std::cout << rows.size() << " run(s). Newest first. Run directory: " << logs_dir << "\n";
+    return 0;
+}
+
+// ---- logs subcommand: tail recent events from latest run ----
+//
+// Reads the most recent run's events.ndjson and prints the last N lines in
+// human-readable form.  Like `tail -n 20 events.ndjson` but formatted.
+
+int cmd_logs(const std::vector<std::string>& args, const std::string& artifact_root) {
+    int tail_n = 20;
+    std::string run_dir;
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--tail" && i + 1 < args.size()) {
+            try { tail_n = std::stoi(args[i + 1]); } catch (...) {}
+            ++i;
+        } else if (!args[i].empty() && args[i][0] != '-') {
+            run_dir = args[i];
+        }
+    }
+
+    // Find most recent run if not specified.
+    if (run_dir.empty()) {
+        const std::string logs = artifact_root + "/logs";
+        std::string best; uint64_t best_t = 0;
+#ifdef _WIN32
+        WIN32_FIND_DATAA ffd;
+        HANDLE h = FindFirstFileA((logs + "\\*").c_str(), &ffd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ffd.cFileName[0] != '.') {
+                    ULARGE_INTEGER t; t.LowPart = ffd.ftLastWriteTime.dwLowDateTime;
+                    t.HighPart = ffd.ftLastWriteTime.dwHighDateTime;
+                    if (t.QuadPart > best_t) { best_t = t.QuadPart; best = logs + "/" + ffd.cFileName; }
+                }
+            } while (FindNextFileA(h, &ffd));
+            FindClose(h);
+        }
+#else
+        DIR* dp = opendir(logs.c_str());
+        if (dp) {
+            struct dirent* ent;
+            while ((ent = readdir(dp)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                const std::string fp = logs + "/" + ent->d_name;
+                struct stat st{};
+                if (stat(fp.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    const uint64_t m = static_cast<uint64_t>(st.st_mtime);
+                    if (m > best_t) { best_t = m; best = fp; }
+                }
+            }
+            closedir(dp);
+        }
+#endif
+        if (best.empty()) {
+            std::cerr << "hermesctl logs: no run directories in " << logs << "\n";
+            return 1;
+        }
+        run_dir = best;
+    }
+
+    const std::string events_path = run_dir + "/events.ndjson";
+    std::ifstream f(events_path);
+    if (!f.is_open()) {
+        std::cerr << "hermesctl logs: cannot open " << events_path << "\n";
+        return 1;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(f, line)) if (!line.empty()) lines.push_back(line);
+
+    const std::size_t start = lines.size() > static_cast<std::size_t>(tail_n)
+        ? lines.size() - static_cast<std::size_t>(tail_n) : 0;
+
+    std::cout << "=== hermesctl logs — last " << tail_n << " events from "
+              << run_dir << " ===\n\n";
+
+    for (std::size_t i = start; i < lines.size(); ++i) {
+        const std::string& l = lines[i];
+        const std::string ekind = jstr(l, "kind");
+        const uint64_t ts_w = jull(l, "ts_wall");
+
+        std::string ts_s = "—";
+        if (ts_w > 0) {
+            const std::time_t t = static_cast<std::time_t>(ts_w / 1000);
+            char buf[24] = {};
+            std::strftime(buf, sizeof(buf), "%H:%M:%S", std::gmtime(&t));
+            ts_s = buf;
+        }
+
+        if (ekind == "band_transition") {
+            const std::string from = jstr(l, "previous_band");
+            const std::string to   = jstr(l, "new_band");
+            const double ups = jdbl(l, "ups");
+            std::cout << ts_s << "  [band   ] " << from << " -> " << to
+                      << "  ups=" << std::fixed << std::setprecision(1) << ups << "\n";
+        } else if (ekind == "state_transition") {
+            std::cout << ts_s << "  [state  ] " << jstr(l, "previous_state")
+                      << " -> " << jstr(l, "new_state") << "\n";
+        } else if (ekind == "action") {
+            std::cout << ts_s << "  [action ] " << jstr(l, "action_type")
+                      << " on " << jstr(l, "target_name") << "\n";
+        } else {
+            std::cout << ts_s << "  [" << std::left << std::setw(7) << ekind << "] "
+                      << l.substr(0, 80) << (l.size() > 80 ? "..." : "") << "\n";
+        }
+    }
+    std::cout << "\n(" << lines.size() << " total events, showing last " << tail_n << ")\n";
+    return 0;
+}
+
 // ---- watch subcommand: streaming timestamped status feed ----
 //
 // Prints one line per interval with timestamp, UPS, band, state, and risk.
@@ -1314,6 +1566,14 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "watch") {
         return cmd_watch(args, socket_path);
+    }
+
+    if (!args.empty() && args[0] == "history") {
+        return cmd_history(artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "logs") {
+        return cmd_logs(args, artifact_root);
     }
 
     if (!args.empty() && args[0] == "ping") {

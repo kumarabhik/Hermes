@@ -205,6 +205,39 @@ std::vector<hermes::PressureSample> make_cooldown_samples() {
     });
 }
 
+// All-states preset: exercises every scheduler state and every intervention level
+// in a single deterministic run.
+//   Normal → Elevated → Throttled (L2) → Cooldown → Recovery → Normal
+//   Also fires L1 (reprioritize) and L3 (terminate) actions along the way.
+// Designed for state-transition coverage testing.
+std::vector<hermes::PressureSample> make_all_states_samples() {
+    return frames_to_samples({
+        // Normal — low pressure baseline
+        {1.0, 0.0, 0.5, 0.0,  5.0,  900.0, 9100.0},
+        {1.5, 0.0, 0.8, 0.0,  8.0, 1200.0, 8800.0},
+        // Elevated — crosses elevated threshold, triggers L1
+        {8.0, 0.3, 5.0, 0.5, 38.0, 4200.0, 5800.0},
+        {12.0, 0.5, 9.0, 1.0, 52.0, 5800.0, 4200.0},
+        {14.0, 0.8, 11.0, 1.5, 58.0, 6200.0, 3800.0},
+        // Throttled — crosses critical, triggers L2 SIGSTOP
+        {18.0, 1.5, 16.0, 3.0, 78.0, 8100.0, 1900.0},
+        {20.0, 2.0, 18.0, 4.0, 85.0, 8800.0, 1200.0},
+        // OOM-imminent — triggers L3 terminate
+        {22.0, 3.0, 22.0, 6.0, 96.0, 9700.0,  300.0},
+        {23.0, 4.0, 24.0, 7.0, 98.0, 9800.0,  200.0},
+        // Cooldown — pressure drops after kill, scheduler enters cooldown
+        {14.0, 1.0, 10.0, 2.0, 60.0, 6500.0, 3500.0},
+        {8.0,  0.5,  6.0, 1.0, 38.0, 4500.0, 5500.0},
+        {5.0,  0.2,  4.0, 0.5, 25.0, 3200.0, 6800.0},
+        // Recovery — sustained low pressure, SIGCONT sent
+        {3.0,  0.0,  2.0, 0.1, 15.0, 2000.0, 8000.0},
+        {2.0,  0.0,  1.5, 0.0, 10.0, 1600.0, 8400.0},
+        // Normal — back to baseline
+        {1.5,  0.0,  1.0, 0.0,  7.0, 1200.0, 8800.0},
+        {1.0,  0.0,  0.5, 0.0,  5.0, 1000.0, 9000.0},
+    });
+}
+
 // Recovery preset: starts at peak pressure, then drops sharply and stays stable.
 // Emphasises the recovery state without retriggering elevated/throttled.
 std::vector<hermes::PressureSample> make_recovery_samples() {
@@ -252,8 +285,10 @@ void print_usage() {
     std::cout << "Usage: hermes_synth [options] [run-id] [artifact-root]\n"
               << "\n"
               << "Options:\n"
-              << "  --recovery   Use recovery-focused sample sequence (high pressure → sharp drop → stable)\n"
-              << "  --cooldown   Use cooldown-focused sample sequence (moderate ramp → sustained → drop)\n"
+              << "  --recovery    Use recovery-focused sample sequence (high pressure → sharp drop → stable)\n"
+              << "  --cooldown    Use cooldown-focused sample sequence (moderate ramp → sustained → drop)\n"
+              << "  --all-states  Comprehensive preset: Normal→Elevated→Throttled→Cooldown→Recovery→Normal\n"
+              << "                Exercises all 5 scheduler states and all 3 intervention levels (L1/L2/L3)\n"
               << "\n"
               << "Generates a deterministic synthetic Hermes pressure run under artifacts/logs/.\n"
               << "Environment overrides: HERMES_RUN_ID, HERMES_ARTIFACT_ROOT, HERMES_CONFIG_PATH, HERMES_CONFIG_HASH.\n";
@@ -262,8 +297,9 @@ void print_usage() {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool preset_recovery = false;
-    bool preset_cooldown = false;
+    bool preset_recovery   = false;
+    bool preset_cooldown   = false;
+    bool preset_all_states = false;
     std::vector<std::string> pos_args;
 
     for (int i = 1; i < argc; ++i) {
@@ -275,6 +311,8 @@ int main(int argc, char** argv) {
             preset_recovery = true;
         } else if (arg == "--cooldown") {
             preset_cooldown = true;
+        } else if (arg == "--all-states") {
+            preset_all_states = true;
         } else {
             pos_args.push_back(arg);
         }
@@ -288,8 +326,9 @@ int main(int argc, char** argv) {
         : env_or("HERMES_RUN_ID", make_run_id());
 
     std::string default_scenario = "synthetic-pressure";
-    if (preset_recovery) { default_scenario = "synthetic-recovery"; }
-    if (preset_cooldown) { default_scenario = "synthetic-cooldown"; }
+    if (preset_recovery)   { default_scenario = "synthetic-recovery"; }
+    if (preset_cooldown)   { default_scenario = "synthetic-cooldown"; }
+    if (preset_all_states) { default_scenario = "synthetic-all-states"; }
     const std::string scenario = env_or("HERMES_SCENARIO", default_scenario);
     const std::string config_path = env_or("HERMES_CONFIG_PATH", "config/schema.yaml");
     const std::string config_hash = env_or("HERMES_CONFIG_HASH", default_config_hash(config_path));
@@ -330,8 +369,9 @@ int main(int argc, char** argv) {
     }
 
     const std::vector<hermes::PressureSample> samples =
-        preset_recovery ? make_recovery_samples() :
-        preset_cooldown ? make_cooldown_samples() :
+        preset_all_states ? make_all_states_samples() :
+        preset_recovery   ? make_recovery_samples()   :
+        preset_cooldown   ? make_cooldown_samples()   :
         make_samples();
     if (!write_manifest(event_logger.run_directory(), run_id, scenario, config_hash, samples.size(), error)) {
         event_logger.log_event(

@@ -1,0 +1,74 @@
+# Hermes Benchmark Scenario — Inference Workload
+#
+# Models a production inference serving environment with a foreground inference
+# server (latency-sensitive) and background batch jobs competing for VRAM.
+#
+# Workload profile:
+#   foreground: tight Python inference loop (simulates a model server)
+#   background: Python memory hog (simulates stale model replicas or batch jobs)
+#
+# Expected behaviour:
+#   - Level 1 fires against background workloads when GPU util > 75%
+#   - OOM-imminent fixture triggers Level 2 if VRAM > 85%
+#   - Foreground inference latency is protected throughout
+#
+# Tier: B (Linux + PSI) or C (Linux + PSI + NVML)
+# Collect evidence with: hermes_bench config/scenario_inference.yaml --runs 5
+
+scenario_name: inference-serving
+
+runtime_mode: active-control
+hermes_config: config/schema_tier_b.yaml   # switch to schema_tier_c.yaml on GPU hosts
+duration_s: 90
+runs: 3
+
+latency_target_ms: 5000        # p95 foreground latency target
+expected_max_oom_count: 0      # inference workloads should not OOM
+expected_max_intervention_count: 10
+
+workloads:
+  # Foreground: simulates a latency-sensitive inference server.
+  # Uses a tight compute loop to generate sustained CPU + modest memory pressure.
+  - name: inference_server
+    foreground: true
+    command: >
+      python3 -c "
+      import math, time, random
+      start = time.time()
+      while time.time() - start < 90:
+          _ = [math.sqrt(i) * random.random() for i in range(10000)]
+          time.sleep(0.01)
+      "
+    # Tier C (GPU): replace with a real CUDA inference loop:
+    # command: >
+    #   python3 -c "
+    #   import torch, time
+    #   model = torch.hub.load('pytorch/vision', 'resnet50', pretrained=False).cuda().eval()
+    #   x = torch.randn(1, 3, 224, 224).cuda()
+    #   start = time.time()
+    #   while time.time() - start < 90:
+    #       with torch.no_grad(): _ = model(x)
+    #       time.sleep(0.05)
+    #   "
+
+  # Background: simulates stale model replicas holding VRAM.
+  - name: stale_model_replica
+    foreground: false
+    command: >
+      python3 -c "
+      import time, sys
+      buf = bytearray(1 * 1024 * 1024 * 1024)  # 1 GB
+      print('stale replica: 1 GB allocated', flush=True)
+      time.sleep(90)
+      "
+
+  # Background: small batch job competing for CPU.
+  - name: batch_job
+    foreground: false
+    command: >
+      python3 -c "
+      import math, time
+      start = time.time()
+      while time.time() - start < 60:
+          _ = [math.factorial(i % 20) for i in range(5000)]
+      "

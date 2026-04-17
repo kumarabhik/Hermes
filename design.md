@@ -2005,12 +2005,35 @@ This section exists to keep future sessions grounded in verified state instead o
 - Next window should: (1) Commit this CW-7 work. (2) Run `.\scripts\smoke_hermes_doctor.ps1` to verify Windows environment. (3) Run `hermes_fault --scenario gpu_contention` and verify fixture is readable by hermes_replay. (4) Run `hermes_bench --smoke-all --dry-run` to verify the new smoke-all path. (5) On Linux: run `bash scripts/smoke_phase6.sh` to advance from T0 to T1–T4.
 
 #### 2026-04-17 IST - Context Window 8 Summary
+
 - Context window covered: Reviewed local repo context plus public GitHub profile/repositories to draft application answers about unique ML perspective and most interesting ML tech stack.
 - Files changed: `design.md`
 - State on exit: Drafted paste-ready answers grounded in GitHub evidence; no source-code or build changes made.
 - Verified artifacts: `README.md`, `RESULTS.md`, `design.md`, `roadmap.md`; git remote `https://github.com/kumarabhik/Hermes.git`
 - Assumptions made: Inferred the broader narrative from public GitHub profile/repos (`Hermes`, `Moviemix`, `PDF-Summary`, `Fraud-ML_Service`, `Remotion-Captioning-Platform`); GitHub MCP connector was unavailable, so public GitHub pages were used instead.
 - Next window should: Refine the wording for the target application if the user shares the role/company and desired tone/length.
+
+#### 2026-04-17 IST - Context Window Summary (CW-10)
+
+- Context window covered: "Do the next 10 big steps that would impact massively on project completion" — tenth session.
+- Files changed:
+  - `.github/workflows/ci.yml` (new) — 3-job GitHub Actions workflow: (1) build-and-smoke-linux: installs cmake+g++, cmake build, verifies all 14 binaries, runs smoke_wsl2.sh, smoke_schema.sh, hermes_simulate smoke, hermes_diff.py, hermes_fault all 8 scenarios, hermes_reeval state_coverage, hermes_eval, hermes_plot --summary, hermesctl headroom, check_evidence_tiers.py, archives artifacts for 7 days; (2) python-scripts: syntax checks all .py scripts, runs hermes_diff.py A→B, B→C, JSON output validation; (3) schema-validation: validates all 4 schema YAML files via smoke_schema.sh.
+  - `src/cli/hermes_export.cpp` (new) — Prometheus metrics exporter: listens on TCP port 9090; `GET /metrics` returns text/plain with hermes_up, hermes_ups, hermes_risk_score, hermes_sample_count, hermes_drop_count, hermes_scheduler_state_info, hermes_last_action_info, hermes_peak_ups, hermes_peak_risk, hermes_level1/2/3_actions_total; sources live data from control socket with telemetry_quality.json fallback; `--once` mode writes to stdout; per-connection threads; Winsock2 + POSIX.
+  - `docs/architecture.md` (new) — comprehensive ASCII-art pipeline diagram covering all 5 layers (monitor, profiler, engine, action, runtime); multi-threaded daemon thread model (sampler ↔ EventBus ↔ policy); full artifact layout tree; CLI tools table (14 binaries); key design invariants (6); scheduler state machine diagram.
+  - `src/cli/hermes_budget.cpp` (new) — standalone budget calculator: reads processes.ndjson + schema thresholds; computes VRAM used vs high/critical thresholds; reports MB headroom; lists top-5 VRAM consumers; gives OK/CAUTION/DENY verdict for "small" (256 MB) and "large" (4 GB) workloads; `--json` flag; Win32 + POSIX directory scan; reads HERMES_CONFIG_PATH.
+  - `src/cli/hermes_annotate.cpp` (new) — standalone decision annotator: reads decisions.ndjson + scores.ndjson + predictions.ndjson; generates plain-English annotation for each frame (UPS, risk, state transition, action phrase, cooldown context, dry-run vs active, root-cause why); writes `annotated_decisions.ndjson` (original JSON + "annotation" field) and `annotated_decisions.txt` audit log; JSON-escapes embedded strings.
+  - `config/scenario_inference.yaml` (new) — pre-built inference serving scenario: foreground tight Python inference loop + background 1 GB model replica + batch job; Tier B/C; duration 90 s, 3 runs; p95 target 5000 ms; Tier C GPU inference loop commented inline.
+  - `config/scenario_training.yaml` (new) — pre-built training scenario: foreground training loop with 30 s checkpoint writes + background data preprocessor (512 MB) + model eval (256 MB, 60 s); Tier B/C; duration 120 s, 3 runs; level-3 cooldown 600 s protects checkpoints.
+  - `scripts/smoke_simulate.ps1` (new) — 7-step Windows smoke for hermes_simulate: generates synth fixture, verifies samples.ndjson, runs hermes_simulate with --compare, verifies all 5 output artifacts, checks total_frames > 0, checks --compare output.
+  - `scripts/smoke_web.ps1` (new) — 5-step Windows smoke for hermes_web: starts server on port 17070 as background job, GET / (200+HTML), GET /api/status (200+JSON), GET /nonexistent (404), stops cleanly.
+  - `scripts/run_all_smoke.ps1` — `$Smokes` array extended with "simulate" (smoke_simulate.ps1) and "web-dashboard" (smoke_web.ps1); header comment updated to "all PowerShell smoke scripts".
+  - `src/cli/hermes_watchdog.cpp` (new) — standalone daemon watchdog: polls hermesd control socket every `--interval-ms` ms; requires 2 consecutive failures before restarting; spawns new hermesd via fork/exec (Linux) or CreateProcess (Windows); max-restart guard; optional `--alert-cmd` shell hook on each restart; SIGCHLD auto-reap; SIGTERM/SIGINT clean exit.
+  - `CMakeLists.txt` — hermes_export, hermes_budget, hermes_annotate, hermes_watchdog targets added; ws2_32 linked for export on Windows; all 4 added to install(TARGETS).
+  - `README.md` — docs/architecture.md added to Documentation table; 10 new tool rows added to New Tools table (hermes_export, hermes_budget, hermes_annotate, hermes_watchdog, scenario_inference.yaml, scenario_training.yaml, CI workflow, architecture.md).
+- State on exit: All 10 steps done. No mid-flight work remaining.
+- Verified artifacts: All files confirmed created/edited. No build run in Windows authoring environment.
+- Roadmap counts after this session: [x] = 62, [~] = 8, [ ] = 14; CI workflow closes T0 evidence automatically on every push.
+- Next window should: (1) Commit CW-10 work and push. (2) Watch GitHub Actions run to confirm CI passes. (3) On Linux: run bash scripts/smoke_wsl2.sh to get T1 evidence. (4) Test hermes_export by running it and curling localhost:9090/metrics. (5) Run hermes_budget on a real run directory. (6) Try hermes_annotate on a synthetic fixture run.
 
 #### 2026-04-17 IST - Context Window Summary (CW-9)
 

@@ -1,6 +1,6 @@
 # run_all_smoke.ps1 — Run every Hermes smoke check in sequence.
 #
-# Executes all seven PowerShell smoke scripts and reports a pass/fail table.
+# Executes all PowerShell smoke scripts and reports a pass/fail/skip table.
 # Each script is expected to exit 0 on success and non-zero on failure.
 #
 # Usage:
@@ -27,7 +27,9 @@ $Smokes = @(
     @{ Name = "benchmark-launch";    Script = "smoke_benchmark_launch.ps1" },
     @{ Name = "benchmark-hermes";    Script = "smoke_benchmark_hermes.ps1" },
     @{ Name = "benchmark-compare";   Script = "smoke_benchmark_compare.ps1" },
-    @{ Name = "active-control";      Script = "smoke_active_control.ps1" }
+    @{ Name = "active-control";      Script = "smoke_active_control.ps1" },
+    @{ Name = "simulate";            Script = "smoke_simulate.ps1" },
+    @{ Name = "web-dashboard";       Script = "smoke_web.ps1" }
 )
 
 $Results = @()

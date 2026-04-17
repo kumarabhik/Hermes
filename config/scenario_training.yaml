@@ -1,0 +1,92 @@
+# Hermes Benchmark Scenario — Training Workload
+#
+# Models a training environment where a foreground training job competes with
+# background preprocessing and evaluation workers for CPU, memory, and VRAM.
+#
+# Workload profile:
+#   foreground: Python training loop (checkpoint writes every 30 s)
+#   background: data preprocessing worker + model evaluation script
+#
+# Expected behaviour:
+#   - Hermes should NOT kill the foreground training job (it is protected)
+#   - Level 1 fires against preprocessing/eval workers under pressure
+#   - Level 3 global cooldown >= 600 s protects checkpoint write windows
+#   - OOM stress path: if VRAM > 85%, background workers are throttled first
+#
+# Tier: B (Linux + PSI) or C (Linux + PSI + NVML)
+# Collect evidence with: hermes_bench config/scenario_training.yaml --runs 5
+
+scenario_name: training-job
+
+runtime_mode: active-control
+hermes_config: config/schema_tier_b.yaml   # switch to schema_tier_c.yaml on GPU hosts
+duration_s: 120
+runs: 3
+
+latency_target_ms: 10000      # training loops tolerate higher latency than inference
+expected_max_oom_count: 0     # Hermes should prevent OOM by throttling workers
+expected_max_intervention_count: 15
+
+workloads:
+  # Foreground: simulates a training loop with periodic checkpoint writes.
+  # Protected: Hermes must never kill or throttle this process.
+  - name: training_loop
+    foreground: true
+    command: >
+      python3 -c "
+      import math, time, random
+      checkpoint_interval = 30
+      start = time.time()
+      epoch = 0
+      while time.time() - start < 120:
+          # Simulate forward + backward pass.
+          _ = [math.log(abs(random.gauss(0, 1)) + 1e-9) for _ in range(50000)]
+          elapsed = time.time() - start
+          if int(elapsed) % checkpoint_interval == 0 and elapsed > 1:
+              print(f'Checkpoint epoch={epoch}', flush=True)
+              time.sleep(0.5)   # simulates checkpoint write latency
+          epoch += 1
+          time.sleep(0.02)
+      "
+    # Tier C (GPU): replace with a real CUDA training loop:
+    # command: >
+    #   python3 -c "
+    #   import torch, time, random
+    #   model = torch.nn.Linear(1024, 1024).cuda()
+    #   opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    #   start = time.time()
+    #   while time.time() - start < 120:
+    #       x = torch.randn(128, 1024).cuda()
+    #       loss = model(x).sum()
+    #       loss.backward()
+    #       opt.step()
+    #       opt.zero_grad()
+    #       time.sleep(0.01)
+    #   "
+
+  # Background: data preprocessing worker (CPU + memory intensive).
+  - name: data_preprocessor
+    foreground: false
+    command: >
+      python3 -c "
+      import math, time, random
+      buf = bytearray(512 * 1024 * 1024)   # 512 MB dataset buffer
+      start = time.time()
+      while time.time() - start < 110:
+          random.shuffle(buf)
+          time.sleep(0.05)
+      "
+
+  # Background: evaluation script (medium memory, runs for 60 s then exits).
+  - name: model_eval
+    foreground: false
+    command: >
+      python3 -c "
+      import time, math, random
+      buf = bytearray(256 * 1024 * 1024)   # 256 MB eval set
+      start = time.time()
+      while time.time() - start < 60:
+          acc = sum(math.sqrt(random.random()) for _ in range(10000)) / 10000
+          time.sleep(0.1)
+      print(f'eval accuracy: {acc:.4f}', flush=True)
+      "

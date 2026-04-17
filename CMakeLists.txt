@@ -105,6 +105,21 @@ if(WIN32)
     target_link_libraries(hermes_web PRIVATE ws2_32)
 endif()
 
+# Prometheus metrics exporter
+add_executable(hermes_export src/cli/hermes_export.cpp)
+if(WIN32)
+    target_link_libraries(hermes_export PRIVATE ws2_32)
+endif()
+
+# VRAM + CPU budget calculator (standalone)
+add_executable(hermes_budget src/cli/hermes_budget.cpp)
+
+# Decision audit annotator (standalone)
+add_executable(hermes_annotate src/cli/hermes_annotate.cpp)
+
+# Daemon health watchdog with auto-restart (standalone)
+add_executable(hermes_watchdog src/cli/hermes_watchdog.cpp)
+
 # ---------------------------------------------------------------------------
 # Install targets
 # ---------------------------------------------------------------------------
@@ -125,6 +140,10 @@ install(TARGETS
     hermes_alert
     hermes_simulate
     hermes_web
+    hermes_export
+    hermes_budget
+    hermes_annotate
+    hermes_watchdog
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

@@ -182,6 +182,7 @@ hermesctl nvml
 | [docs/tuning_guide.md](docs/tuning_guide.md) | UPS weights, thresholds, cooldowns, multi-GPU placement, protection rules — safe adjustment procedure |
 | [docs/calibration_guide.md](docs/calibration_guide.md) | Step-by-step predictor calibration runbook: eval → hermes_tune → schema edit → verify → iterate |
 | [docs/wsl2_quickstart.md](docs/wsl2_quickstart.md) | WSL2 build guide, PSI/NVML setup, smoke suite, perf/strace capture, compatibility table |
+| [docs/architecture.md](docs/architecture.md) | Full pipeline ASCII diagram, artifact layout, CLI index, scheduler state machine |
 | [design.md](design.md) | Architecture, intervention policy, session handoff log |
 | [roadmap.md](roadmap.md) | Phase-by-phase status with `[x]`/`[~]`/`[ ]` evidence tracking |
 
@@ -196,6 +197,14 @@ hermesctl nvml
 | `hermesctl headroom` | Reports UPS headroom to elevated/critical thresholds and gives a safe-to-launch verdict for a new workload |
 | `scripts/hermes_diff.py` | Side-by-side diff of two schema YAML files with impact estimates (tighter/looser thresholds, UPS shift in pts) |
 | `config/schema_tier_c.yaml` | Calibrated starting-point config for Linux + PSI + GPU: tighter thresholds, Level 2 enabled, circuit breaker on |
+| `hermes_export` | Prometheus metrics exporter at `:9090/metrics` — UPS, risk, action counts for Grafana/Prometheus |
+| `hermes_budget` | VRAM + CPU budget report: headroom to thresholds, top consumers, launch feasibility verdict |
+| `hermes_annotate` | Annotates `decisions.ndjson` with plain-English rationale; writes `annotated_decisions.txt` audit log |
+| `hermes_watchdog` | Polls control socket and auto-restarts hermesd on failure; configurable max-restarts + alert command |
+| `config/scenario_inference.yaml` | Pre-built scenario for inference serving workloads |
+| `config/scenario_training.yaml` | Pre-built scenario for ML training jobs with checkpoint protection |
+| `.github/workflows/ci.yml` | GitHub Actions CI: builds on Ubuntu, runs full smoke suite on every push |
+| `docs/architecture.md` | Full pipeline ASCII diagram, artifact layout, CLI index, scheduler state machine |
 
 **Circuit breaker** (in `Scheduler`): when ≥ `max_interventions_per_window` Level-2/3 actions fire within `window_ms`, the scheduler enters a forced cooldown for `forced_cooldown_ms` to prevent cascading kill storms. Configurable in `schema_tier_c.yaml` under `circuit_breaker:`.
 

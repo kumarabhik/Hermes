@@ -13,6 +13,14 @@ struct SchedulerConfig {
     uint64_t level2_cooldown_ms{20000};
     uint64_t level3_cooldown_ms{300000};
     int stable_cycles_for_recovery{3};
+
+    // Circuit breaker: if >= max_interventions_per_window L2/L3 actions fire
+    // within window_ms, the scheduler enters forced cooldown for
+    // forced_cooldown_ms to prevent cascading kill storms.
+    bool circuit_breaker_enabled{true};
+    int  max_interventions_per_window{4};
+    uint64_t circuit_breaker_window_ms{60000};
+    uint64_t forced_cooldown_ms{120000};
 };
 
 class Scheduler {
@@ -38,6 +46,10 @@ private:
     std::unordered_map<int, uint64_t> pid_cooldowns_;
     uint64_t global_level3_cooldown_until_{0};
     int stable_cycle_count_{0};
+
+    // Circuit breaker state
+    std::vector<uint64_t> intervention_timestamps_;  // mono ms of each L2/L3 action
+    uint64_t circuit_breaker_until_{0};              // forced cooldown end time
 };
 
 } // namespace hermes

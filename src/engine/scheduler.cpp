@@ -103,6 +103,23 @@ InterventionDecision Scheduler::evaluate(
         return finalize(decision);
     }
 
+    // Circuit breaker: count recent L2/L3 interventions within the window.
+    if (config_.circuit_breaker_enabled) {
+        if (circuit_breaker_until_ > now) {
+            state_ = SchedulerState::Cooldown;
+            decision.cooldown_state = "circuit-breaker";
+            decision.why = "Circuit breaker tripped: too many interventions in window";
+            return finalize(decision);
+        }
+        // Evict timestamps older than the window.
+        const uint64_t window_start = now >= config_.circuit_breaker_window_ms
+            ? now - config_.circuit_breaker_window_ms : 0;
+        intervention_timestamps_.erase(
+            std::remove_if(intervention_timestamps_.begin(), intervention_timestamps_.end(),
+                [window_start](uint64_t t) { return t < window_start; }),
+            intervention_timestamps_.end());
+    }
+
     if (risk.risk_band == RiskBand::Critical &&
         score.band == PressureBand::Critical &&
         candidate != nullptr) {
@@ -114,6 +131,12 @@ InterventionDecision Scheduler::evaluate(
         decision.why = "Critical risk with critical UPS; reasons=" + join_reasons(risk.reason_codes);
         decision.should_execute = config_.mode != OperatingMode::ObserveOnly;
         global_level3_cooldown_until_ = now + config_.level3_cooldown_ms;
+        if (config_.circuit_breaker_enabled) {
+            intervention_timestamps_.push_back(now);
+            if (static_cast<int>(intervention_timestamps_.size()) >= config_.max_interventions_per_window) {
+                circuit_breaker_until_ = now + config_.forced_cooldown_ms;
+            }
+        }
         return finalize(decision);
     }
 
@@ -133,6 +156,12 @@ InterventionDecision Scheduler::evaluate(
         decision.why = "High risk or critical UPS; reasons=" + join_reasons(risk.reason_codes);
         decision.should_execute = config_.mode != OperatingMode::ObserveOnly;
         set_pid_cooldown(candidate->pid, now, config_.level2_cooldown_ms);
+        if (config_.circuit_breaker_enabled) {
+            intervention_timestamps_.push_back(now);
+            if (static_cast<int>(intervention_timestamps_.size()) >= config_.max_interventions_per_window) {
+                circuit_breaker_until_ = now + config_.forced_cooldown_ms;
+            }
+        }
         return finalize(decision);
     }
 

@@ -185,6 +185,40 @@ hermesctl nvml
 | [design.md](design.md) | Architecture, intervention policy, session handoff log |
 | [roadmap.md](roadmap.md) | Phase-by-phase status with `[x]`/`[~]`/`[ ]` evidence tracking |
 
+## New Tools (CW-8)
+
+| Tool | What it does |
+| --- | --- |
+| `hermes_web` | Embedded HTTP server serving a live auto-refreshing browser dashboard at `http://localhost:7070`; proxies the control socket JSON |
+| `hermes_simulate` | Feeds any `samples.ndjson` through the real pipeline and writes full run artifacts — Windows-testable without a kernel or GPU |
+| `hermes_alert` | Polls the control socket and HTTP-POSTs a webhook when the scheduler enters Throttled/Cooldown/Elevated state; per-incident suppression |
+| `hermesctl top` | Ranks processes by UPS pressure contribution (VRAM×0.35 + GPU-util×0.18 + CPU×0.15); shows best Level-2/3 candidates |
+| `hermesctl headroom` | Reports UPS headroom to elevated/critical thresholds and gives a safe-to-launch verdict for a new workload |
+| `scripts/hermes_diff.py` | Side-by-side diff of two schema YAML files with impact estimates (tighter/looser thresholds, UPS shift in pts) |
+| `config/schema_tier_c.yaml` | Calibrated starting-point config for Linux + PSI + GPU: tighter thresholds, Level 2 enabled, circuit breaker on |
+
+**Circuit breaker** (in `Scheduler`): when ≥ `max_interventions_per_window` Level-2/3 actions fire within `window_ms`, the scheduler enters a forced cooldown for `forced_cooldown_ms` to prevent cascading kill storms. Configurable in `schema_tier_c.yaml` under `circuit_breaker:`.
+
+```bash
+# Quick start: simulate a saved run on Windows
+hermes_simulate artifacts/logs/my-run/samples.ndjson --compare artifacts/logs/my-run
+
+# Launch web dashboard (daemon must be running on Linux)
+hermes_web --port 7070 --socket /tmp/hermesd.sock
+
+# Check if there is headroom to launch a new training job
+hermesctl headroom --ups 52.3
+
+# Who is consuming the most pressure?
+hermesctl top artifacts/logs/my-run
+
+# Alert me when Hermes throttles anything
+hermes_alert --webhook https://hooks.slack.com/... --dry-run
+
+# Compare Tier B vs Tier C config thresholds
+python3 scripts/hermes_diff.py config/schema_tier_b.yaml config/schema_tier_c.yaml
+```
+
 ## Achieved Outcomes (Authoring Environment)
 
 The following outcomes are evidenced by artifacts in this repo and smoke run outputs.

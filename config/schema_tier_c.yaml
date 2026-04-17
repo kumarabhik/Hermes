@@ -1,0 +1,106 @@
+# Hermes Configuration — Tier C (Linux + PSI + GPU, production active-control)
+#
+# Use this config on Linux hosts where ALL of the following are confirmed:
+#   - /proc/pressure/* files exist (PSI enabled kernel)
+#   - NVML fast path active: hermesctl nvml shows device count + VRAM
+#   - T2 evidence: predictor fires under real GPU/memory pressure
+#   - T4 evidence: before/after latency and OOM counts collected
+#
+# Tier C enables Level 2 throttling and placement-aware kills.  Do NOT enable
+# Level 3 or placement_aware_kills until you have T4 evidence showing the
+# predictor reaches precision >= 0.85 on this host.
+#
+# Promotion checklist:
+#   [ ] bash scripts/hermes_doctor.sh  → all Tier C checks pass
+#   [ ] hermesctl nvml                 → device name, VRAM, util all reported
+#   [ ] hermes_eval on baseline run    → precision >= 0.85, FP rate < 5/hr
+#   [ ] hermes_bench --verify-targets  → all runs meet latency/OOM targets
+#   [ ] low_pressure_scenario.yaml     → intervention_count <= 1
+#
+# Reference: docs/calibration_guide.md, docs/tuning_guide.md
+
+version: 1
+
+# --- UPS weight profile for Linux + PSI + GPU hosts ---
+# Weights are calibrated for a host running multiple concurrent ML workloads
+# with GPU memory contention as the primary failure mode.
+# Sum: 0.15 + 0.12 + 0.13 + 0.18 + 0.35 + 0.07 = 1.00
+ups_weights:
+  cpu_some:  0.15    # CPU some-stall (PSI) — lower than Tier B; GPU is dominant
+  mem_some:  0.12    # Memory some-stall (PSI)
+  mem_full:  0.13    # Memory full-stall (PSI) — critical signal when non-zero
+  gpu_util:  0.18    # GPU utilisation — higher weight; reflects compute saturation
+  vram_used: 0.35    # VRAM fill ratio — dominant OOM predictor on GPU hosts
+  io_full:   0.07    # IO full-stall — lower weight; GPU workloads are not IO-bound
+
+# --- Tightened thresholds for GPU-saturated hosts ---
+# These are conservative starting values calibrated to trigger before VRAM OOM.
+# Run hermes_tune.py after each calibration cycle to refine per-host.
+thresholds:
+  ups:
+    elevated: 35     # Lower than Tier B; GPU hosts approach OOM faster
+    critical: 65     # Tighter critical band; leaves room for predictor lead time
+  mem_psi:
+    elevated_full_avg10: 1.5   # Tighter: GPU hosts show PSI spikes before OOM
+    critical_full_avg10: 4.0
+  vram:
+    high_pct:     85           # 5 pp lower than Tier B; VRAM OOMs are fast
+    critical_pct: 92           # Reserve 8% headroom for inference batch allocs
+  predictor:
+    high_risk: 0.65            # Slightly lower threshold; prefer early warning
+
+# --- Cooldowns tuned for ML workload restart latency ---
+# Level 3 global cooldown is extended to 10 min to prevent repeated kills
+# disrupting training checkpointing cycles.
+cooldowns:
+  level_1_pid_sec:         12   # Faster recovery at L1 (reprioritize is cheap)
+  level_2_pid_sec:         25   # Throttle hold: enough to let memory reclaim run
+  level_3_global_sec:     600   # 10 min: protect checkpoint write windows
+  recovery_hysteresis_sec:  8
+
+# --- Actions: Level 1 + Level 2 enabled; Level 3 requires explicit opt-in ---
+# Workflow to enable Level 3:
+#   1. Collect T4 evidence (before/after OOM counts across 5 runs).
+#   2. Confirm intervention_count is reasonable in decisions.ndjson.
+#   3. Set enable_level_3: true and placement_aware_kills: true.
+#   4. Re-run smoke_phase6.sh to verify no false-positive kills.
+actions:
+  enable_level_1: true
+  enable_level_2: true     # Enabled after T2 evidence; throttle before SIGKILL
+  enable_level_3: false    # Enable only with T4 evidence + placement data
+  observe_only_mode: false # Active-control mode; confirm T2 evidence first
+
+# Circuit breaker: prevent intervention storms when pressure does not clear.
+# If more than max_interventions_per_window level-2/3 actions fire in
+# window_sec seconds, Hermes enters forced cooldown for forced_cooldown_sec.
+circuit_breaker:
+  enabled:                    true
+  max_interventions_per_window: 4
+  window_sec:                  60
+  forced_cooldown_sec:        120
+
+# --- Multi-GPU placement (enabled at Tier C) ---
+# placement_aware_kills: false until T4 evidence confirms predictor quality.
+# Set placement_aware_kills: true only after enable_level_3: true.
+# device_allowlist: [] = all NVML-visible devices; exclude display GPU if needed.
+multi_gpu:
+  vram_aggregation:      sum    # Sum VRAM across all GPUs for UPS scoring
+  per_pid_vram_merge:    true   # Count each PID's VRAM from all devices
+  device_allowlist:      []     # e.g. [0,1] to restrict to compute GPUs only
+  placement_aware_kills: false  # Flip to true only after enable_level_3: true
+
+# --- Protected processes (extended for GPU host services) ---
+protected_pids: [1]
+protected_names:
+  - sshd
+  - systemd
+  - journald
+  - nvidia-smi
+  - cron
+  - rsyslogd
+  - Xorg
+  - gnome-shell
+  - nv-hostengine        # DCGM host engine — never kill
+  - dcgmi                # DCGM CLI
+  - containerd           # Container runtime
+  - dockerd              # Docker daemon

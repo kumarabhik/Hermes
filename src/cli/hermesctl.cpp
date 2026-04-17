@@ -7,19 +7,24 @@
 //   hermesctl [--socket /tmp/hermesd.sock] [--interval-ms 1000] [--once]
 //   hermesctl ping
 //   hermesctl status
-//   hermesctl nvml          Check NVML availability and print device summary
-//   hermesctl eval [dir]    Show offline predictor evaluation for a run directory
-//   hermesctl bench         List recent benchmark run summaries from artifacts/bench/
-//   hermesctl diff          Compare two eval_summary.json files side by side
-//   hermesctl schema [path] Print a formatted table of all tunable parameters in schema.yaml
+//   hermesctl nvml               Check NVML availability and print device summary
+//   hermesctl eval [dir]         Show offline predictor evaluation for a run directory
+//   hermesctl bench              List recent benchmark run summaries from artifacts/bench/
+//   hermesctl diff               Compare two eval_summary.json files side by side
+//   hermesctl schema [path]      Print a formatted table of all tunable parameters in schema.yaml
+//   hermesctl top [run-dir]      Rank processes by UPS pressure contribution from latest run
+//   hermesctl headroom [--ups N] Report UPS headroom and safe-to-launch verdict
 //
 // On non-Linux platforms, falls back to reading the most recent run directory
 // from artifacts/logs/ and printing a static summary.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -888,6 +893,306 @@ int cmd_schema(const std::vector<std::string>& args, const std::string& /*artifa
     return 0;
 }
 
+// ---- top subcommand: rank processes by pressure contribution ----
+//
+// Reads the most recent processes.ndjson from a run directory and scores each
+// PID's contribution to UPS using: VRAM fill ratio * 0.35 + GPU util * 0.18
+// + CPU pct * 0.15 (matching Tier B/C weight profiles).  Prints a ranked table.
+
+int cmd_top(const std::vector<std::string>& args, const std::string& artifact_root) {
+    std::string run_dir;
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (!args[i].empty() && args[i][0] != '-') { run_dir = args[i]; break; }
+    }
+
+    // Resolve to most recent run if not given.
+    if (run_dir.empty()) {
+        const std::string logs_dir = artifact_root + "/logs";
+        std::string best;
+        uint64_t best_time = 0;
+#ifdef _WIN32
+        WIN32_FIND_DATAA ffd;
+        HANDLE h = FindFirstFileA((logs_dir + "\\*").c_str(), &ffd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ffd.cFileName[0] != '.') {
+                    ULARGE_INTEGER t; t.LowPart = ffd.ftLastWriteTime.dwLowDateTime;
+                    t.HighPart = ffd.ftLastWriteTime.dwHighDateTime;
+                    if (t.QuadPart > best_time) { best_time = t.QuadPart; best = logs_dir + "/" + ffd.cFileName; }
+                }
+            } while (FindNextFileA(h, &ffd));
+            FindClose(h);
+        }
+#else
+        DIR* dir = opendir(logs_dir.c_str());
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                const std::string full = logs_dir + "/" + ent->d_name;
+                struct stat st{};
+                if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    const uint64_t m = static_cast<uint64_t>(st.st_mtime);
+                    if (m > best_time) { best_time = m; best = full; }
+                }
+            }
+            closedir(dir);
+        }
+#endif
+        if (best.empty()) {
+            std::cerr << "hermesctl top: no run directories in " << logs_dir << "\n";
+            return 1;
+        }
+        run_dir = best;
+    }
+
+    const std::string procs_path = run_dir + "/processes.ndjson";
+    std::ifstream f(procs_path);
+    if (!f.is_open()) {
+        std::cerr << "hermesctl top: cannot open " << procs_path << "\n";
+        return 1;
+    }
+
+    struct ProcEntry {
+        int pid{0};
+        std::string name;
+        double gpu_mb{0.0};
+        double cpu_pct{0.0};
+        double gpu_util{0.0};
+        double vram_ratio{0.0};
+        double score{0.0};
+        bool foreground{false};
+        bool protected_proc{false};
+    };
+
+    // Accumulate per-PID stats (last-seen wins — most recent sample).
+    std::vector<ProcEntry> entries;
+    double vram_total_mb = 0.0;
+
+    auto jf = [](const std::string& s, const std::string& k) -> double {
+        const std::string kk = "\"" + k + "\":";
+        const auto p = s.find(kk);
+        if (p == std::string::npos) return 0.0;
+        const auto start = p + kk.size();
+        try { return std::stod(s.substr(start)); } catch (...) { return 0.0; }
+    };
+    auto js = [](const std::string& s, const std::string& k) -> std::string {
+        const std::string kk = "\"" + k + "\":\"";
+        const auto p = s.find(kk);
+        if (p == std::string::npos) return "";
+        const auto st = p + kk.size();
+        const auto en = s.find('"', st);
+        return en == std::string::npos ? "" : s.substr(st, en - st);
+    };
+    auto jb = [](const std::string& s, const std::string& k) -> bool {
+        const std::string kk = "\"" + k + "\":";
+        const auto p = s.find(kk);
+        if (p == std::string::npos) return false;
+        const auto st = s.find_first_not_of(" \t", p + kk.size());
+        return st != std::string::npos && s.substr(st, 4) == "true";
+    };
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        const int pid = static_cast<int>(jf(line, "pid"));
+        if (pid <= 0) continue;
+
+        // Track global VRAM total from samples if present.
+        const double vt = jf(line, "vram_total_mb");
+        if (vt > vram_total_mb) vram_total_mb = vt;
+
+        // Upsert PID entry.
+        auto it = std::find_if(entries.begin(), entries.end(),
+            [pid](const ProcEntry& e) { return e.pid == pid; });
+        if (it == entries.end()) { entries.push_back({}); it = entries.end() - 1; }
+
+        it->pid = pid;
+        it->name = js(line, "name");
+        it->gpu_mb   = jf(line, "gpu_mb");
+        it->cpu_pct  = jf(line, "cpu_pct");
+        it->gpu_util = jf(line, "gpu_util_pct");
+        it->foreground    = jb(line, "foreground");
+        it->protected_proc = jb(line, "protected_process");
+    }
+
+    if (entries.empty()) {
+        std::cout << "hermesctl top: no process records in " << procs_path << "\n";
+        return 0;
+    }
+
+    // Score each process (Tier B/C weight approximation).
+    const double vram_cap = vram_total_mb > 0.0 ? vram_total_mb : 8192.0;
+    for (auto& e : entries) {
+        e.vram_ratio = std::min(e.gpu_mb / vram_cap, 1.0);
+        e.score = e.vram_ratio * 0.35 + (e.gpu_util / 100.0) * 0.18 + (e.cpu_pct / 100.0) * 0.15;
+    }
+
+    std::sort(entries.begin(), entries.end(),
+        [](const ProcEntry& a, const ProcEntry& b) { return a.score > b.score; });
+
+    const std::string sep(82, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl top — process pressure ranking (" << run_dir << ")\n";
+    std::cout << sep << "\n";
+    std::cout << std::left
+              << std::setw(8)  << "PID"
+              << std::setw(22) << "Name"
+              << std::right
+              << std::setw(10) << "Score"
+              << std::setw(10) << "VRAM MB"
+              << std::setw(10) << "GPU%"
+              << std::setw(8)  << "CPU%"
+              << std::setw(6)  << "FG"
+              << std::setw(6)  << "PROT" << "\n";
+    std::cout << std::string(82, '-') << "\n";
+
+    std::cout << std::fixed << std::setprecision(3);
+    for (const auto& e : entries) {
+        const std::string nm = e.name.size() > 20 ? e.name.substr(0, 17) + "..." : e.name;
+        std::cout << std::left
+                  << std::setw(8)  << e.pid
+                  << std::setw(22) << nm
+                  << std::right
+                  << std::setw(10) << e.score
+                  << std::setw(10) << static_cast<int>(e.gpu_mb)
+                  << std::setw(10) << static_cast<int>(e.gpu_util)
+                  << std::setw(8)  << static_cast<int>(e.cpu_pct)
+                  << std::setw(6)  << (e.foreground ? "Y" : "N")
+                  << std::setw(6)  << (e.protected_proc ? "Y" : "N") << "\n";
+    }
+    std::cout << sep << "\n";
+    std::cout << "  Score = VRAM_ratio*0.35 + GPU_util*0.18 + CPU_pct*0.15  (Tier B/C weights)\n";
+    std::cout << "  Highest-score background (FG=N, PROT=N) processes are Level-2/3 candidates.\n";
+    return 0;
+}
+
+// ---- headroom subcommand: UPS headroom admission check ----
+//
+// Reports remaining UPS budget before elevated/critical thresholds and gives
+// a safe-to-launch verdict.  Without a live daemon, reads the most recent
+// telemetry_quality.json for peak UPS.
+
+int cmd_headroom(const std::vector<std::string>& args, const std::string& artifact_root) {
+    // Optional: --ups <value> to override with a real-time UPS reading.
+    double current_ups = -1.0;
+    for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+        if (args[i] == "--ups") {
+            try { current_ups = std::stod(args[i + 1]); } catch (...) {}
+        }
+    }
+
+    // Read thresholds from config/schema.yaml (or HERMES_CONFIG_PATH).
+    const char* cfg_env = std::getenv("HERMES_CONFIG_PATH");
+    const std::string cfg_path = (cfg_env && cfg_env[0]) ? cfg_env : "config/schema.yaml";
+    double elevated_threshold = 40.0;
+    double critical_threshold = 70.0;
+    {
+        std::ifstream fc(cfg_path);
+        std::string line;
+        bool in_ups = false;
+        while (std::getline(fc, line)) {
+            if (line.find("ups:") != std::string::npos) { in_ups = true; continue; }
+            if (in_ups && line.find("elevated:") != std::string::npos) {
+                const auto p = line.find(':');
+                try { elevated_threshold = std::stod(line.substr(p + 1)); } catch (...) {}
+            }
+            if (in_ups && line.find("critical:") != std::string::npos) {
+                const auto p = line.find(':');
+                try { critical_threshold = std::stod(line.substr(p + 1)); } catch (...) {}
+                break;
+            }
+        }
+    }
+
+    // If no live UPS supplied, read peak from the most recent telemetry_quality.json.
+    if (current_ups < 0.0) {
+        const std::string logs_dir = artifact_root + "/logs";
+        std::string best_run;
+        uint64_t best_time = 0;
+#ifdef _WIN32
+        WIN32_FIND_DATAA ffd2;
+        HANDLE h2 = FindFirstFileA((logs_dir + "\\*").c_str(), &ffd2);
+        if (h2 != INVALID_HANDLE_VALUE) {
+            do {
+                if ((ffd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ffd2.cFileName[0] != '.') {
+                    ULARGE_INTEGER t2; t2.LowPart = ffd2.ftLastWriteTime.dwLowDateTime;
+                    t2.HighPart = ffd2.ftLastWriteTime.dwHighDateTime;
+                    if (t2.QuadPart > best_time) { best_time = t2.QuadPart; best_run = logs_dir + "/" + ffd2.cFileName; }
+                }
+            } while (FindNextFileA(h2, &ffd2));
+            FindClose(h2);
+        }
+#else
+        DIR* dr = opendir(logs_dir.c_str());
+        if (dr) {
+            struct dirent* ent;
+            while ((ent = readdir(dr)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                const std::string full = logs_dir + "/" + ent->d_name;
+                struct stat st2{};
+                if (stat(full.c_str(), &st2) == 0 && S_ISDIR(st2.st_mode)) {
+                    const uint64_t m = static_cast<uint64_t>(st2.st_mtime);
+                    if (m > best_time) { best_time = m; best_run = full; }
+                }
+            }
+            closedir(dr);
+        }
+#endif
+        if (!best_run.empty()) {
+            std::ifstream tq(best_run + "/telemetry_quality.json");
+            if (tq.is_open()) {
+                const std::string tqj((std::istreambuf_iterator<char>(tq)),
+                                       std::istreambuf_iterator<char>());
+                const std::string kk = "\"peak_ups\":";
+                const auto p = tqj.find(kk);
+                if (p != std::string::npos) {
+                    try { current_ups = std::stod(tqj.substr(p + kk.size())); } catch (...) {}
+                }
+            }
+        }
+    }
+
+    const std::string sep(60, '=');
+    std::cout << sep << "\n";
+    std::cout << "hermesctl headroom — UPS admission check\n";
+    std::cout << sep << "\n";
+    std::cout << std::fixed << std::setprecision(1);
+    std::cout << "Config          : " << cfg_path << "\n";
+    std::cout << "Elevated thresh : " << elevated_threshold << "\n";
+    std::cout << "Critical thresh : " << critical_threshold << "\n";
+
+    if (current_ups < 0.0) {
+        std::cout << "Current UPS     : unknown (no recent run; pass --ups <value>)\n";
+        std::cout << "Verdict         : UNKNOWN — run hermesd first or pass --ups\n";
+        return 1;
+    }
+
+    const double headroom_elevated = elevated_threshold - current_ups;
+    const double headroom_critical = critical_threshold - current_ups;
+    std::cout << "Current UPS     : " << current_ups << "\n";
+    std::cout << "Headroom (elev) : " << headroom_elevated << " pts\n";
+    std::cout << "Headroom (crit) : " << headroom_critical << " pts\n";
+
+    std::string verdict;
+    int rc = 0;
+    if (current_ups >= critical_threshold) {
+        verdict = "DENY — system is at CRITICAL pressure; do not launch new workloads";
+        rc = 2;
+    } else if (current_ups >= elevated_threshold) {
+        verdict = "CAUTION — system is ELEVATED; launch only if workload is small";
+        rc = 1;
+    } else if (headroom_elevated < 10.0) {
+        verdict = "CAUTION — headroom < 10 pts; monitor closely after launch";
+        rc = 1;
+    } else {
+        verdict = "OK — sufficient headroom to launch a new workload";
+    }
+    std::cout << "Verdict         : " << verdict << "\n";
+    std::cout << sep << "\n";
+    return rc;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -921,6 +1226,14 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "schema") {
         return cmd_schema(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "top") {
+        return cmd_top(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "headroom") {
+        return cmd_headroom(args, artifact_root);
     }
 
     if (!args.empty() && args[0] == "ping") {

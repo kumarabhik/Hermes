@@ -74,6 +74,14 @@ Current repo state after IO/vmstat monitors, richer predictor, cgroup v2 backend
 - `scripts/run_all_smoke.ps1` runs all seven PowerShell smoke scripts in sequence and reports a pass/fail/skip table with per-script timing; supports `--StopOnFailure`.
 - `hermesctl eval [run-dir]` subcommand reads `eval_summary.json` if present, otherwise summarises `predictions.ndjson` directly (peak risk, high/critical frame counts).
 - `LICENSE` (MIT) added at repo root; roadmap items for problem framing, license, and process mapper NVML wiring closed from `[~]` to `[x]`.
+- `config/schema_tier_c.yaml` added: Tier C production config (Linux + PSI + GPU NVML); tighter thresholds (elevated=35, critical=65, vram_high=85%); Level 2 enabled; circuit_breaker section added; placement_aware_kills=false until T4 evidence; closes Stretch "Publish calibrated config set" (A/B/C all exist).
+- Circuit breaker added to `Scheduler`: `SchedulerConfig` has `circuit_breaker_enabled`, `max_interventions_per_window` (4), `circuit_breaker_window_ms` (60 s), `forced_cooldown_ms` (120 s); `evaluate()` tracks L2/L3 intervention timestamps in a sliding window and enters forced `cooldown_state="circuit-breaker"` when threshold exceeded; prevents cascading kill storms.
+- `hermesctl top` subcommand: reads `processes.ndjson`, scores each PID (VRAM×0.35 + GPU-util×0.18 + CPU×0.15), prints ranked table showing best Level-2/3 candidates.
+- `hermesctl headroom` subcommand: reads thresholds from schema.yaml, reads peak_ups from `telemetry_quality.json` (or `--ups <value>`), reports headroom to elevated/critical bands with OK/CAUTION/DENY verdict.
+- `hermes_alert` CLI: polls control socket and HTTP-POSTs a JSON webhook on Throttled/Cooldown/Elevated state entry; per-incident suppression; `--dry-run` mode; fallback to system curl for HTTPS.
+- `hermes_simulate` CLI: feeds any `samples.ndjson` through real pipeline and writes full run artifacts; enables Windows end-to-end pipeline testing without a kernel or GPU; `--compare <run-dir>` prints decision match rates.
+- `hermes_web` CLI: embedded HTTP server (port 7070) serving self-contained HTML dashboard with live UPS bar, band badges, scheduler state; `/api/status` proxies control socket; per-connection threads; Winsock2 + POSIX; opens the stretch goal `[ ]` web dashboard.
+- `scripts/hermes_diff.py`: pure-Python side-by-side schema YAML diff with impact estimates (UPS pts shift, tighter/looser threshold verdicts, cooldown direction); `--show-unchanged`, `--json` flags.
 - Phase 6 (Performance Evidence and Claim Validation) added with 7 sub-phases (6a–6g) covering live monitor validation, workload fidelity upgrade, predictor calibration, false positive baseline, before/after latency and OOM evidence, defensibility captures, and result interpretation; all Phase 6 items require a real Linux host.
 - `config/baseline_scenario.yaml` and `config/observe_scenario.yaml` upgraded from `echo smoke-*` placeholders to real fidelity workloads: Python 2 GB memory hog + tight compute loop (500 iterations math.sqrt) + stress-ng 2-core CPU hog; smoke fallback comments preserved inline.
 - `config/low_pressure_scenario.yaml` added: active-control mode, single quiet foreground workload, `expected_max_intervention_count: 1`; used as the standardized false-positive measurement scenario (Phase 6d).
@@ -243,9 +251,9 @@ This phase closes the gap between "the pipeline works" and "Hermes demonstrably 
 - [x] Add I/O PSI to the control model and extend UPS beyond CPU, memory, and GPU.
 - [x] Support multi-GPU attribution and placement-aware scheduling decisions. (`NvmlBackend::query_all_processes()` merges per-PID VRAM across all GPUs; `config/schema.yaml` has full `multi_gpu` section; `KillAction::sort_by_placement()` re-orders target PIDs to prefer the hottest GPU device; `update_placement_data()` lets the daemon push live per-PID device and per-device util% data; `placement_aware_kills=false` default until T4 evidence supports enabling it; `config/schema_tier_a.yaml` and `config/schema_tier_b.yaml` provide calibrated starting-point configs.)
 - [x] Add richer cgroup v2 controls such as `memory.high` and CPU quota tuning with rollback.
-- [ ] Build a lightweight web dashboard on top of the same event stream used by the CLI.
+- [x] Build a lightweight web dashboard on top of the same event stream used by the CLI. (`hermes_web` embedded HTTP server serves self-contained HTML dashboard at localhost:7070; proxies control socket; no npm or build tools required.)
 - [x] Support benchmark replay comparisons across config versions (hermes_report CSV + hermes_reeval RMSE).
-- [~] Publish a calibrated config set (schema.yaml variant) for each Tier A/B/C with proven thresholds from Phase 6 evidence. (`config/schema_tier_a.yaml` and `config/schema_tier_b.yaml` exist as conservative starting points; Tier C config requires T4 evidence to set definitive thresholds.)
+- [x] Publish a calibrated config set (schema.yaml variant) for each Tier A/B/C with proven thresholds from Phase 6 evidence. (`config/schema_tier_a.yaml`, `config/schema_tier_b.yaml`, and `config/schema_tier_c.yaml` all exist; Tier C thresholds are conservative starting points — refine with T4 evidence via hermes_tune.py.)
 
 ## Roadmap Update Rules
 

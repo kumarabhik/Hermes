@@ -89,6 +89,22 @@ add_executable(hermes_report src/cli/hermes_report.cpp)
 # Benchmark Comparison Aggregator CLI (standalone)
 add_executable(hermes_compare src/cli/hermes_compare.cpp)
 
+# Alert watcher CLI — watches control socket and POSTs webhook on critical state
+add_executable(hermes_alert src/cli/hermes_alert.cpp)
+if(WIN32)
+    target_link_libraries(hermes_alert PRIVATE ws2_32)
+endif()
+
+# Full-pipeline simulation from saved NDJSON samples (Windows-testable)
+add_executable(hermes_simulate src/cli/hermes_simulate.cpp)
+target_link_libraries(hermes_simulate PRIVATE hermes_core)
+
+# Embedded HTTP server with live browser dashboard
+add_executable(hermes_web src/cli/hermes_web.cpp)
+if(WIN32)
+    target_link_libraries(hermes_web PRIVATE ws2_32)
+endif()
+
 # ---------------------------------------------------------------------------
 # Install targets
 # ---------------------------------------------------------------------------
@@ -106,6 +122,9 @@ install(TARGETS
     hermes_bench
     hermes_report
     hermes_compare
+    hermes_alert
+    hermes_simulate
+    hermes_web
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

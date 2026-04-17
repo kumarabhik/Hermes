@@ -205,6 +205,11 @@ hermesctl nvml
 | `config/scenario_training.yaml` | Pre-built scenario for ML training jobs with checkpoint protection |
 | `.github/workflows/ci.yml` | GitHub Actions CI: builds on Ubuntu, runs full smoke suite on every push |
 | `docs/architecture.md` | Full pipeline ASCII diagram, artifact layout, CLI index, scheduler state machine |
+| `hermes_pack` | Packages a run directory into a portable evidence bundle with FNV-1a manifest; supports `--list` (dry-run) and `--output-dir` |
+| `hermesctl watch` | Streaming timestamped status feed (UPS, band, state, risk) — pipeline-friendly, no screen-clear |
+| `hermes_replay --generate-manifest` | Auto-generates `scenario_manifest.json` from observed peaks/states/actions to lock in a run as a regression baseline |
+| `scripts/hermes_quickstart.sh` | One-command Linux T0/T1 evidence setup: builds, smokes, checks PSI, prints readiness checklist |
+| `config/scenario_multimodel.yaml` | Pre-built multi-model serving scenario: inference server + training job + batch ETL + stale replica |
 
 **Circuit breaker** (in `Scheduler`): when ≥ `max_interventions_per_window` Level-2/3 actions fire within `window_ms`, the scheduler enters a forced cooldown for `forced_cooldown_ms` to prevent cascading kill storms. Configurable in `schema_tier_c.yaml` under `circuit_breaker:`.
 

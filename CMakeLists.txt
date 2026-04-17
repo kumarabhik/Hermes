@@ -120,6 +120,9 @@ add_executable(hermes_annotate src/cli/hermes_annotate.cpp)
 # Daemon health watchdog with auto-restart (standalone)
 add_executable(hermes_watchdog src/cli/hermes_watchdog.cpp)
 
+# Evidence bundle packager (standalone — no hermes_core needed)
+add_executable(hermes_pack src/cli/hermes_pack.cpp)
+
 # ---------------------------------------------------------------------------
 # Install targets
 # ---------------------------------------------------------------------------
@@ -144,6 +147,7 @@ install(TARGETS
     hermes_budget
     hermes_annotate
     hermes_watchdog
+    hermes_pack
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

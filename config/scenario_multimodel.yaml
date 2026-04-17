@@ -1,0 +1,107 @@
+# scenario_multimodel.yaml — Multi-model serving scenario.
+#
+# Simulates a production multi-model environment: a high-priority inference
+# server (foreground) competes with a concurrently training model (background)
+# and a batch feature-extraction job (background).  This is the most common
+# real-world contention pattern for GPU-serving clusters.
+#
+# Tier A (CPU-only): uses Python compute loops as workload proxies.
+# Tier B/C (Linux + GPU): swap the foreground command for a real PyTorch
+#   inference loop and the background commands for a real training job.
+#
+# Run:
+#   hermes_bench config/scenario_multimodel.yaml --runs 3
+#   hermes_bench config/scenario_multimodel.yaml --runs 3 \
+#       --hermes-bin build/hermesd --replay-bin build/hermes_replay \
+#       --verify-targets
+
+scenario_name: multimodel_serving
+runtime_mode: active-control   # set to observe-only for first run
+duration_s: 120
+runs: 3
+
+# Latency target for the foreground inference server.
+latency_target_ms: 8000
+expected_max_oom_count: 0
+
+# ── Foreground: inference server (high priority) ──────────────────────────────
+# Tier A/B proxy: tight Python compute loop simulating inference request handling.
+# Tier C replacement: python3 -c "import torch; ..."
+foreground:
+  name: inference_server
+  # Tier A/B smoke proxy (CPU-only, no PyTorch required):
+  command: >
+    python3 -c "
+    import math, time
+    for i in range(2000):
+        _ = [math.sin(x * 0.001) for x in range(500)]
+        time.sleep(0.05)
+    "
+  # Tier C GPU inference loop (uncomment and replace above when running on GPU host):
+  # command: >
+  #   python3 -c "
+  #   import torch, time
+  #   m = torch.nn.Linear(1024, 1024).cuda()
+  #   x = torch.randn(32, 1024).cuda()
+  #   for _ in range(500):
+  #       with torch.no_grad(): m(x)
+  #       time.sleep(0.1)
+  #   "
+  timeout_s: 125
+  expected_exit_code: 0
+
+# ── Background: concurrent training job ──────────────────────────────────────
+# Holds ~1.5 GB RAM to simulate a model replica being trained.
+background:
+  - name: training_job
+    # Tier A/B proxy:
+    command: >
+      python3 -c "
+      import time
+      buf = b'x' * (1536 * 1024 * 1024)
+      for i in range(240):
+          time.sleep(0.5)
+          _ = len(buf)
+      "
+    # Tier C GPU training loop (uncomment for real GPU contention):
+    # command: >
+    #   python3 -c "
+    #   import torch, torch.nn as nn, time
+    #   model = nn.Sequential(nn.Linear(2048, 2048), nn.ReLU(), nn.Linear(2048, 512)).cuda()
+    #   opt = torch.optim.Adam(model.parameters())
+    #   x = torch.randn(64, 2048).cuda()
+    #   for i in range(200):
+    #       opt.zero_grad()
+    #       loss = model(x).sum()
+    #       loss.backward()
+    #       opt.step()
+    #       time.sleep(0.3)
+    #   "
+    timeout_s: 125
+    expected_exit_code: 0
+
+  # ── Background: batch feature extraction job ────────────────────────────────
+  - name: batch_feature_extractor
+    # Tier A/B proxy: CPU-bound data processing simulation.
+    command: >
+      python3 -c "
+      import math, time
+      for i in range(120):
+          data = [math.log(x + 1.0) for x in range(50000)]
+          _ = sum(data)
+          time.sleep(1.0)
+      "
+    timeout_s: 125
+    expected_exit_code: 0
+
+  # ── Background: stale model replica (OOM pressure candidate) ───────────────
+  - name: stale_model_replica
+    # Holds 512 MB — the first candidate for Level 3 kill if OOM risk rises.
+    command: >
+      python3 -c "
+      import time
+      buf = b'y' * (512 * 1024 * 1024)
+      time.sleep(115)
+      "
+    timeout_s: 120
+    expected_exit_code: 0

@@ -7,6 +7,7 @@
 //   hermesctl [--socket /tmp/hermesd.sock] [--interval-ms 1000] [--once]
 //   hermesctl ping
 //   hermesctl status
+//   hermesctl watch [--interval-ms 2000] [--count N]  Streaming timestamped status feed
 //   hermesctl nvml               Check NVML availability and print device summary
 //   hermesctl eval [dir]         Show offline predictor evaluation for a run directory
 //   hermesctl bench              List recent benchmark run summaries from artifacts/bench/
@@ -893,6 +894,81 @@ int cmd_schema(const std::vector<std::string>& args, const std::string& /*artifa
     return 0;
 }
 
+// ---- watch subcommand: streaming timestamped status feed ----
+//
+// Prints one line per interval with timestamp, UPS, band, state, and risk.
+// Designed for piping to grep/tail or logging to a file.
+// Unlike the default live-refresh mode, watch does NOT clear the screen.
+
+int cmd_watch(const std::vector<std::string>& args, const std::string& socket_path) {
+    int interval_ms = 2000;
+    int count = 0;  // 0 = unlimited
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--interval-ms" && i + 1 < args.size()) {
+            try { interval_ms = std::stoi(args[i + 1]); } catch (...) {}
+            ++i;
+        } else if (args[i] == "--count" && i + 1 < args.size()) {
+            try { count = std::stoi(args[i + 1]); } catch (...) {}
+            ++i;
+        }
+    }
+
+    std::cout << "hermesctl watch — streaming status (interval=" << interval_ms << "ms";
+    if (count > 0) std::cout << ", count=" << count;
+    std::cout << ", Ctrl-C to stop)\n";
+    std::cout << std::string(72, '-') << "\n";
+    std::cout << std::left
+              << std::setw(22) << "timestamp"
+              << std::setw(8)  << "UPS"
+              << std::setw(10) << "band"
+              << std::setw(14) << "state"
+              << std::setw(8)  << "risk"
+              << "last_action\n";
+    std::cout << std::string(72, '-') << "\n";
+    std::cout.flush();
+
+    int iterations = 0;
+    while (count == 0 || iterations < count) {
+        const std::string resp = socket_request(socket_path, "{\"kind\":\"status\"}");
+
+        const auto now = std::chrono::system_clock::now();
+        const auto ts  = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count();
+        const std::time_t tt = static_cast<std::time_t>(ts);
+        char tsbuf[24] = {};
+        std::strftime(tsbuf, sizeof(tsbuf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&tt));
+
+        if (resp.empty()) {
+            std::cout << std::left << std::setw(22) << tsbuf
+                      << "(daemon unreachable)\n";
+        } else {
+            const double ups      = jdbl(resp, "ups");
+            const std::string pb  = jstr(resp, "pressure_band");
+            const std::string st  = jstr(resp, "scheduler_state");
+            const double risk     = jdbl(resp, "risk_score");
+            const std::string act = jstr(resp, "last_action");
+
+            std::ostringstream ups_s;
+            ups_s << std::fixed << std::setprecision(1) << ups;
+            std::ostringstream risk_s;
+            risk_s << std::fixed << std::setprecision(3) << risk;
+
+            std::cout << std::left
+                      << std::setw(22) << tsbuf
+                      << std::setw(8)  << ups_s.str()
+                      << std::setw(10) << pb
+                      << std::setw(14) << st
+                      << std::setw(8)  << risk_s.str()
+                      << act << "\n";
+        }
+        std::cout.flush();
+        ++iterations;
+        if (count > 0 && iterations >= count) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+    return 0;
+}
+
 // ---- top subcommand: rank processes by pressure contribution ----
 //
 // Reads the most recent processes.ndjson from a run directory and scores each
@@ -1234,6 +1310,10 @@ int main(int argc, char* argv[]) {
 
     if (!args.empty() && args[0] == "headroom") {
         return cmd_headroom(args, artifact_root);
+    }
+
+    if (!args.empty() && args[0] == "watch") {
+        return cmd_watch(args, socket_path);
     }
 
     if (!args.empty() && args[0] == "ping") {
